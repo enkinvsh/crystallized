@@ -3,7 +3,7 @@
   "mcp": {
     "memory": {
       "command": [
-        "uv",
+        "UV_PATH",
         "run",
         "--project",
         "MEMORY_PATH",

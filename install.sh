@@ -485,8 +485,10 @@ generate_config() {
 
   mkdir -p "$dest_dir"
 
-  # Expand actual memory path
+  # Expand actual paths
   local memory_path="$MEMORY_DEST"
+  local uv_path
+  uv_path="$(command -v uv 2>/dev/null || echo "$HOME/.local/bin/uv")"
 
   if [[ ! -f "$template" ]]; then
     warn "config/opencode.json template not found in repo ($template)."
@@ -496,7 +498,7 @@ generate_config() {
 
   if [[ ! -f "$dest" ]]; then
     # Fresh install — copy template with placeholder replaced
-    sed "s|MEMORY_PATH|$memory_path|g" "$template" > "$dest"
+    sed -e "s|MEMORY_PATH|$memory_path|g" -e "s|UV_PATH|$uv_path|g" "$template" > "$dest"
     success "Config written to $dest"
     return
   fi
@@ -513,10 +515,10 @@ import json, sys
 template_path = '$template'
 dest_path     = '$dest'
 memory_path   = '$memory_path'
+uv_path       = '$uv_path'
 
-# Load template (replace placeholder)
 with open(template_path) as f:
-    raw = f.read().replace('MEMORY_PATH', memory_path)
+    raw = f.read().replace('MEMORY_PATH', memory_path).replace('UV_PATH', uv_path)
 template_config = json.loads(raw)
 
 # Load existing config
