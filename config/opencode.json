@@ -15,7 +15,6 @@
     }
   },
   "plugin": [
-    "@thehugeman/opencode-anthropic-auth-community@latest",
     "oh-my-openagent@latest"
   ]
 }

@@ -573,18 +573,83 @@ print('skipped:' + ','.join(skipped) if skipped else 'skipped:')
 generate_config
 
 # ═══════════════════════════════════════════════
+step "9. Authentication"
+# ═══════════════════════════════════════════════
+
+authenticate() {
+  if [[ "$OS" != "darwin" ]]; then
+    info "Linux detected — skipping automatic auth. Run manually:"
+    info "  python3 $REPO_DIR/auth/extract_token.py"
+    return
+  fi
+
+  if [[ ! -d "/Applications/Claude.app" ]]; then
+    die "Claude.app not found at /Applications/Claude.app. Install Claude for macOS first."
+  fi
+
+  local auth_file="$HOME/.local/share/opencode/auth.json"
+  if [[ -f "$auth_file" ]]; then
+    local has_token
+    has_token="$($PYTHON_BIN -c "
+import json, sys
+try:
+    with open('$auth_file') as f:
+        data = json.load(f)
+    anthropic = data.get('providers', data).get('anthropic', {})
+    print('yes' if anthropic.get('refresh') or anthropic.get('refreshToken') or anthropic.get('refresh_token') else 'no')
+except:
+    print('no')
+" 2>/dev/null)"
+    if [[ "$has_token" == "yes" ]]; then
+      success "Already authenticated"
+      return
+    fi
+  fi
+
+  info "Installing cryptography package..."
+  pip3 install cryptography --break-system-packages -q 2>/dev/null || pip3 install cryptography -q || {
+    warn "Could not install cryptography. Auth may fail."
+  }
+
+  local password
+  read -r -s -p "Enter your macOS login password (for Keychain access): " password
+  echo ""
+  security unlock-keychain -p "$password" ~/Library/Keychains/login.keychain-db 2>/dev/null || {
+    warn "Keychain unlock failed — will attempt extraction anyway"
+  }
+
+  info "Extracting Claude auth token..."
+  if "$PYTHON_BIN" "$REPO_DIR/auth/extract_token.py" --skip-quit-check --apply 0 2>/dev/null; then
+    success "Authentication complete"
+    return
+  fi
+
+  info "First token failed, trying second..."
+  if "$PYTHON_BIN" "$REPO_DIR/auth/extract_token.py" --skip-quit-check --apply 1 2>/dev/null; then
+    success "Authentication complete"
+    return
+  fi
+
+  warn "Automatic auth failed. Run manually after setup:"
+  warn "  python3 $REPO_DIR/auth/extract_token.py"
+}
+
+authenticate
+
+# ═══════════════════════════════════════════════
 echo -e "\n${GREEN}${BOLD}╔══════════════════════════════════════════╗${RESET}"
 echo -e "${GREEN}${BOLD}║   🎉  crystallized setup complete!       ║${RESET}"
 echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════╝${RESET}\n"
 
 echo -e "${BOLD}Next steps:${RESET}"
 echo -e "  ${CYAN}1.${RESET} Run ${BOLD}opencode${RESET} to start the AI assistant"
-echo -e "  ${CYAN}2.${RESET} On first run, authenticate with your Anthropic account"
-echo -e "  ${CYAN}3.${RESET} The memory MCP server will start automatically via opencode"
+echo -e "  ${CYAN}2.${RESET} The memory MCP server will start automatically via opencode"
 echo ""
 echo -e "${YELLOW}Tip:${RESET} If 'opencode' is not found, add ${BOLD}$HOME/.local/bin${RESET} to your PATH:"
 echo -e "       ${BOLD}export PATH=\"\$HOME/.local/bin:\$PATH\"${RESET}"
 echo -e "     (add this to ~/.bashrc, ~/.zshrc, or ~/.profile)"
+echo ""
+echo -e "${YELLOW}If auth failed, run:${RESET} ${BOLD}python3 auth/extract_token.py${RESET}"
 echo ""
 echo -e "${CYAN}Memory data stored at:${RESET} ${BOLD}$MEMORY_DEST${RESET}"
 echo -e "${CYAN}Config file:${RESET}           ${BOLD}$CONFIG_DEST${RESET}"
