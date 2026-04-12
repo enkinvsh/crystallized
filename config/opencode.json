@@ -1,0 +1,21 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "memory": {
+      "command": [
+        "uv",
+        "run",
+        "--project",
+        "MEMORY_PATH",
+        "python",
+        "MEMORY_PATH/server.py"
+      ],
+      "enabled": true,
+      "type": "local"
+    }
+  },
+  "plugin": [
+    "@thehugeman/opencode-anthropic-auth-community@latest",
+    "oh-my-openagent@latest"
+  ]
+}

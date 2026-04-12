@@ -1,0 +1,28 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Memory data (generated at runtime in ~/.config/opencode/memory/, never committed)
+chroma_db/
+vault/
+identity.json
+redis-facts-dump.json
+
+# Logs
+*.log
+backup.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# uv
+uv.lock

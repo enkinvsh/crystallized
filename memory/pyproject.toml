@@ -1,0 +1,11 @@
+[project]
+name = "opencode-memory"
+version = "1.0.0"
+description = "Three-layer MCP memory server: Redis facts + ChromaDB semantic + filesystem docs"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "mcp[cli]>=1.9.0",
+    "redis>=5.0.0",
+    "chromadb>=1.0.0",
+    "sentence-transformers>=3.0.0",
+]
