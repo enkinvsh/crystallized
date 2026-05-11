@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Set up Python ${{ matrix.python }}
+        run: uv python install ${{ matrix.python }}
+
+      - name: Install deps
+        working-directory: memory
+        run: uv sync --group dev --frozen
+
+      - name: Lint (ruff)
+        working-directory: memory
+        run: uv run ruff check .
+
+      - name: Type check (pyright)
+        working-directory: memory
+        run: uv run pyright
+
+      - name: Run tests
+        working-directory: memory
+        run: uv run pytest tests/ ../auth/tests/ -v
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck install.sh and uninstall.sh
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y shellcheck
+          shellcheck install.sh uninstall.sh
