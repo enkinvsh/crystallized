@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ─────────────────────────────────────────────
-# crystallized — one-shot setup script
+# crystallized, one-shot setup script
 # Sets up opencode + oh-my-openagent + MCP memory server
 # ─────────────────────────────────────────────
 
@@ -197,7 +197,9 @@ install_redis() {
 start_redis() {
   # Check if already running
   if redis-cli ping &>/dev/null 2>&1; then
-    success "Redis is running"
+    success "Redis is already running on localhost:6379"
+    info "Memory will share this Redis instance. If that is not desired,"
+    info "set REDIS_URL before starting opencode."
     return
   fi
 
@@ -404,14 +406,28 @@ deploy_memory() {
   mkdir -p "$dest"
   info "Copying memory server files to $dest..."
 
-  # Copy all files from memory/ — overwrite scripts but keep user data
-  for f in "$src"/*; do
-    [[ -e "$f" ]] || continue
-    local fname
-    fname="$(basename "$f")"
-    cp "$f" "$dest/$fname"
+  # Explicit runtime allowlist. Required files must exist in the repo;
+  # optional files are copied only when present. This avoids deploying
+  # test fixtures, tooling configs, caches, or virtualenvs.
+  local required_files=(server.py memory-inject.py own-voice.py pyproject.toml uv.lock)
+  local optional_files=(.python-version README.md)
+
+  local fname
+  for fname in "${required_files[@]}"; do
+    if [[ ! -f "$src/$fname" ]]; then
+      die "Required memory file missing in repo: memory/$fname"
+    fi
+    cp "$src/$fname" "$dest/$fname"
     info "  copied: $fname"
   done
+
+  for fname in "${optional_files[@]}"; do
+    if [[ -f "$src/$fname" ]]; then
+      cp "$src/$fname" "$dest/$fname"
+      info "  copied: $fname"
+    fi
+  done
+
   success "Memory server files deployed"
 }
 
@@ -427,8 +443,8 @@ run_uv_sync() {
     return
   fi
 
-  info "Running uv sync in $MEMORY_DEST..."
-  (cd "$MEMORY_DEST" && uv sync) || die "uv sync failed. Check $MEMORY_DEST/pyproject.toml for errors."
+  info "Running uv sync --frozen in $MEMORY_DEST..."
+  (cd "$MEMORY_DEST" && uv sync --frozen) || die "uv sync --frozen failed. Check $MEMORY_DEST/pyproject.toml and uv.lock for errors."
   success "Python dependencies installed"
 }
 
@@ -497,14 +513,21 @@ generate_config() {
   fi
 
   if [[ ! -f "$dest" ]]; then
-    # Fresh install — copy template with placeholder replaced
+    # Fresh install, copy template with placeholder replaced
     sed -e "s|MEMORY_PATH|$memory_path|g" -e "s|UV_PATH|$uv_path|g" "$template" > "$dest"
     success "Config written to $dest"
     return
   fi
 
-  # Config already exists — attempt to merge MCP section
+  # Config already exists, attempt to merge MCP section
   warn "Config already exists at $dest"
+
+  # Backup existing config before any merge/write
+  local backup
+  backup="$dest.bak.$(date +%Y%m%d-%H%M%S)"
+  cp "$dest" "$backup"
+  info "Backup of existing config written to: $backup"
+
   info "Attempting to merge MCP section from template..."
 
   # Use Python for JSON merging (already a prerequisite)
@@ -578,7 +601,7 @@ step "9. Authentication"
 
 authenticate() {
   if [[ "$OS" != "darwin" ]]; then
-    info "Linux detected — skipping automatic auth. Run manually:"
+    info "Linux detected, skipping automatic auth. Run manually:"
     info "  python3 $REPO_DIR/auth/extract_token.py"
     return
   fi
@@ -615,7 +638,11 @@ except:
   read -r -s -p "Enter your macOS login password (for Keychain access): " password
   echo ""
   security unlock-keychain -p "$password" ~/Library/Keychains/login.keychain-db 2>/dev/null || {
-    warn "Keychain unlock failed — will attempt extraction anyway"
+    warn "Keychain unlock failed. This usually means:"
+    warn "  - the password is wrong, or"
+    warn "  - the login keychain is in a different location."
+    warn "The extractor will try anyway. If it fails, run it manually:"
+    warn "  python3 $REPO_DIR/auth/extract_token.py"
   }
 
   info "Extracting Claude auth token..."
