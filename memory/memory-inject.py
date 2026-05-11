@@ -10,16 +10,15 @@ for fast semantic search (~50-100ms). Falls back to keyword matching
 if the socket is unavailable.
 """
 
+import glob as _glob
 import json
 import os
+import os as _os
 import socket
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
-import os as _os
-import glob as _glob
 
 _VENV_SITE_PATTERN = _os.path.join(
     _os.path.dirname(__file__), ".venv", "lib", "python3.*", "site-packages"
@@ -29,11 +28,21 @@ _VENV_SITE = _VENV_SITES[0] if _VENV_SITES else ""
 if _VENV_SITE and _os.path.isdir(_VENV_SITE) and _VENV_SITE not in sys.path:
     sys.path.insert(0, _VENV_SITE)
 
-NOTES_DIR = Path.home() / ".config" / "opencode" / "memory" / "notes"
-CHROMA_DIR = Path.home() / ".config" / "opencode" / "memory" / "chroma_db"
+NOTES_DIR = Path(
+    os.environ.get(
+        "OPENCODE_MEMORY_NOTES_DIR",
+        str(Path.home() / ".config" / "opencode" / "memory" / "notes"),
+    )
+)
+CHROMA_DIR = Path(
+    os.environ.get(
+        "OPENCODE_MEMORY_CHROMA_DIR",
+        str(Path.home() / ".config" / "opencode" / "memory" / "chroma_db"),
+    )
+)
 REDIS_PREFIX = "opencode:memory"
 VOLUME_INDEX_KEY = f"{REDIS_PREFIX}:volume_index"
-QUERY_SOCKET = "/tmp/opencode-memory-query.sock"
+QUERY_SOCKET = os.environ.get("OPENCODE_MEMORY_SOCKET", "/tmp/opencode-memory-query.sock")
 
 _redis_conn = None
 
@@ -43,7 +52,16 @@ def get_redis():
     if _redis_conn is None:
         import redis
 
-        _redis_conn = redis.Redis(host="localhost", port=6379, decode_responses=True)
+        url = os.environ.get("REDIS_URL")
+        if url:
+            _redis_conn = redis.Redis.from_url(url, decode_responses=True)
+        else:
+            host = os.environ.get("REDIS_HOST", "localhost")
+            port = int(os.environ.get("REDIS_PORT", "6379"))
+            db = int(os.environ.get("REDIS_DB", "0"))
+            _redis_conn = redis.Redis(
+                host=host, port=port, db=db, decode_responses=True
+            )
     return _redis_conn
 
 
@@ -85,7 +103,7 @@ def get_top_volume_entries(top_n: int = 5) -> list[str]:
         return []
 
     result = []
-    for entry_key, score in entries:
+    for entry_key, score in entries:  # type: ignore[union-attr]
         result.append(f"  {entry_key} (vol:{score:.0f})")
     return result
 
@@ -209,7 +227,7 @@ def get_relevant_facts_keyword(
         return [], 0
 
     parsed_facts = []
-    for key, raw in raw_facts.items():
+    for key, raw in raw_facts.items():  # type: ignore[union-attr]
         try:
             parsed = json.loads(raw)
             value = parsed.get("value", "")
@@ -245,7 +263,7 @@ def get_relevant_facts_keyword(
     facts.sort(key=lambda x: (x[3], x[2]), reverse=True)
 
     output = []
-    for key, value, vol, score in facts[:top_n]:
+    for key, value, vol, _score in facts[:top_n]:
         display_val = value[:80] + "..." if len(value) > 80 else value
         output.append(f"  {key}: {display_val} (vol:{vol:.0f})")
     return output, len(facts)
@@ -296,7 +314,7 @@ def main():
                 mem_lines.append(
                     f"  [{m['score']:.2f}] {text}{tags} (vol:{m['volume']:.0f})"
                 )
-            sections.append(f"[Memory] Relevant memories:\n" + "\n".join(mem_lines))
+            sections.append("[Memory] Relevant memories:\n" + "\n".join(mem_lines))
 
         elapsed = semantic_results.get("time_ms", "?")
         sections.append(f"[Memory] Semantic search: {elapsed}ms")

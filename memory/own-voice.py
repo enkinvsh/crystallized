@@ -12,10 +12,15 @@ Also reads the latest journal entry for open questions.
 Output format: [OwnVoice] block injected before the prompt.
 """
 
-import sys
+import os
 from pathlib import Path
 
-NOTES_DIR = Path.home() / ".config" / "opencode" / "memory" / "notes"
+NOTES_DIR = Path(
+    os.environ.get(
+        "OPENCODE_MEMORY_NOTES_DIR",
+        str(Path.home() / ".config" / "opencode" / "memory" / "notes"),
+    )
+)
 SELF_DIR = NOTES_DIR / "self"
 JOURNAL_DIR = NOTES_DIR / "journal"
 

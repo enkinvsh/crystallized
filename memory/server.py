@@ -16,6 +16,7 @@ Internal Query Socket:
 - Piggybacks on warm encoder — zero cold start for hooks
 """
 
+import contextlib
 import hashlib
 import json
 import math  # noqa: F401 — used in volume decay
@@ -24,17 +25,27 @@ import re
 import socket as _socket
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
+import chromadb
 import numpy as np
 import redis
-import chromadb
-from sentence_transformers import SentenceTransformer
 from mcp.server.fastmcp import FastMCP
+from sentence_transformers import SentenceTransformer
 
-NOTES_DIR = Path.home() / ".config" / "opencode" / "memory" / "notes"
-CHROMA_DIR = Path.home() / ".config" / "opencode" / "memory" / "chroma_db"
+NOTES_DIR = Path(
+    os.environ.get(
+        "OPENCODE_MEMORY_NOTES_DIR",
+        str(Path.home() / ".config" / "opencode" / "memory" / "notes"),
+    )
+)
+CHROMA_DIR = Path(
+    os.environ.get(
+        "OPENCODE_MEMORY_CHROMA_DIR",
+        str(Path.home() / ".config" / "opencode" / "memory" / "chroma_db"),
+    )
+)
 REDIS_PREFIX = "opencode:memory"
 
 # ---------------------------------------------------------------------------
@@ -69,7 +80,14 @@ _encoder: SentenceTransformer | None = None
 def get_redis() -> redis.Redis:
     global _redis
     if _redis is None:
-        _redis = redis.Redis(host="localhost", port=6379, decode_responses=True)
+        url = os.environ.get("REDIS_URL")
+        if url:
+            _redis = redis.Redis.from_url(url, decode_responses=True)
+        else:
+            host = os.environ.get("REDIS_HOST", "localhost")
+            port = int(os.environ.get("REDIS_PORT", "6379"))
+            db = int(os.environ.get("REDIS_DB", "0"))
+            _redis = redis.Redis(host=host, port=port, db=db, decode_responses=True)
         _redis.ping()
     return _redis
 
@@ -106,13 +124,26 @@ def _zset_key(layer: str, entry_id: str) -> str:
 def _get_volume(layer: str, entry_id: str) -> float:
     """Get raw stored volume from ZSET (source of truth)."""
     score = get_redis().zscore(VOLUME_INDEX_KEY, _zset_key(layer, entry_id))
-    return score if score is not None else DEFAULT_VOLUME.get(layer, 50.0)
+    return score if score is not None else DEFAULT_VOLUME.get(layer, 50.0)  # type: ignore[return-value]
 
 
 def _set_volume(layer: str, entry_id: str, volume: float) -> None:
     """Set volume in ZSET (source of truth)."""
     clamped = max(MIN_VOLUME, min(MAX_VOLUME, volume))
     get_redis().zadd(VOLUME_INDEX_KEY, {_zset_key(layer, entry_id): clamped})
+
+
+def _decay_volume(stored: float, t_hours: float, layer: str) -> float:
+    """Pure power-law decay: V_eff = V_stored * (1 + t_hours / τ)^(-α), floored at MIN_VOLUME.
+
+    No Redis, no Chroma, no filesystem, no clock reads — testable in isolation.
+    """
+    if t_hours <= 0:
+        return stored
+    alpha = DECAY_ALPHA.get(layer, 0.1)
+    tau = DECAY_TAU.get(layer, 168.0)
+    decayed = stored * (1 + t_hours / tau) ** (-alpha)
+    return max(MIN_VOLUME, decayed)
 
 
 def _effective_volume(
@@ -134,13 +165,7 @@ def _effective_volume(
     else:
         age_hours = 0.0
 
-    if age_hours <= 0:
-        return stored
-
-    alpha = DECAY_ALPHA.get(layer, 0.1)
-    tau = DECAY_TAU.get(layer, 168.0)
-    decayed = stored * (1 + age_hours / tau) ** (-alpha)
-    return max(MIN_VOLUME, decayed)
+    return _decay_volume(stored, age_hours, layer)
 
 
 def _reinforce(layer: str, entry_id: str, quality: float = 1.0) -> float:
@@ -199,7 +224,9 @@ def _substring_search_semantic(query: str, n_results: int = 5) -> list[tuple]:
 
         if query_lower in doc.lower():
             eff_vol = _effective_volume(
-                "semantic", doc_id, meta.get("last_reinforced_at") if meta else None
+                "semantic",
+                doc_id,
+                meta.get("last_reinforced_at") if meta else None,  # type: ignore[arg-type]
             )
             matches.append((doc, meta, eff_vol, doc_id))
 
@@ -219,7 +246,8 @@ def _log_memory_event(
 
     Events: create, recall, reinforce, decay, update, delete_attempt
     """
-    try:
+    with contextlib.suppress(Exception):
+        # non-critical, best-effort logging
         get_redis().xadd(
             f"{REDIS_PREFIX}:events",
             {
@@ -231,8 +259,6 @@ def _log_memory_event(
             },
             maxlen=100000,  # keep last 100K events, auto-trim
         )
-    except Exception:
-        pass  # non-critical, best-effort logging
 
 
 # ===================================================================
@@ -262,7 +288,7 @@ def save_fact(key: str, value: str) -> str:
         _set_volume("fact", key, DEFAULT_VOLUME["fact"])
         _log_memory_event(key, "create", DEFAULT_VOLUME["fact"], "fact")
     else:
-        _log_memory_event(key, "update", existing_vol, "fact")
+        _log_memory_event(key, "update", existing_vol, "fact")  # type: ignore[arg-type]
     _invalidate_fact_embeddings()
     return f"Saved fact: {key} = {value}"
 
@@ -352,7 +378,7 @@ def search_memory(query: str, n_results: int = 5) -> str:
         if not matches:
             return "No relevant memories found."
         lines = []
-        for doc, meta, eff_vol, doc_id in matches:
+        for doc, meta, eff_vol, _doc_id in matches:
             date = meta.get("date", "unknown") if meta else "unknown"
             tags = meta.get("tags", "") if meta else ""
             tag_str = f" [{tags}]" if tags else ""
@@ -387,14 +413,16 @@ def search_memory(query: str, n_results: int = 5) -> str:
         doc_id = results["ids"][0][i]
 
         eff_vol = _effective_volume(
-            "semantic", doc_id, meta.get("last_reinforced_at") if meta else None
+            "semantic",
+            doc_id,
+            meta.get("last_reinforced_at") if meta else None,  # type: ignore[arg-type]
         )
         norm_volume = eff_vol / MAX_VOLUME
 
         age_hours = 0.0
         timestamp = meta.get("timestamp", 0) if meta else 0
         if timestamp:
-            age_hours = (time.time() - timestamp) / 3600.0
+            age_hours = (time.time() - timestamp) / 3600.0  # type: ignore[operator]
         recency = (1 + age_hours / 24.0) ** (-0.3)
 
         composite = 0.50 * semantic_sim + 0.30 * norm_volume + 0.20 * recency
@@ -403,7 +431,7 @@ def search_memory(query: str, n_results: int = 5) -> str:
     scored_results.sort(key=lambda x: x[2], reverse=True)
 
     lines = []
-    for doc, meta, composite, semantic_sim, eff_vol, doc_id in scored_results:
+    for doc, meta, composite, _semantic_sim, eff_vol, _doc_id in scored_results:
         date = meta.get("date", "unknown") if meta else "unknown"
         tags = meta.get("tags", "") if meta else ""
         tag_str = f" [{tags}]" if tags else ""
@@ -551,10 +579,8 @@ def recall(query: str, n_results: int = 5) -> str:
                 for doc, meta, eff_vol, doc_id in matches:
                     _reinforce("semantic", doc_id, quality=0.5)
                     meta["last_reinforced_at"] = datetime.now().isoformat()
-                    try:
+                    with contextlib.suppress(Exception):
                         collection.update(ids=[doc_id], metadatas=[meta])
-                    except Exception:
-                        pass
                     date = meta.get("date", "unknown") if meta else "unknown"
                     tags = meta.get("tags", "") if meta else ""
                     tag_str = f" [{tags}]" if tags else ""
@@ -586,14 +612,14 @@ def recall(query: str, n_results: int = 5) -> str:
 
                         doc_id = results["ids"][0][i]
                         new_vol = _reinforce("semantic", doc_id, quality=0.5)
-                        meta["last_reinforced_at"] = datetime.now().isoformat()
-                        try:
+                        meta["last_reinforced_at"] = datetime.now().isoformat()  # type: ignore[index]
+                        with contextlib.suppress(Exception):
                             collection.update(ids=[doc_id], metadatas=[meta])
-                        except Exception:
-                            pass
 
                         eff_vol = _effective_volume(
-                            "semantic", doc_id, meta.get("last_reinforced_at")
+                            "semantic",
+                            doc_id,
+                            meta.get("last_reinforced_at"),  # type: ignore[arg-type]
                         )
                         date = meta.get("date", "unknown") if meta else "unknown"
                         tags = meta.get("tags", "") if meta else ""
@@ -723,7 +749,7 @@ def reinforce(key: str, layer: str = "fact") -> str:
     if layer == "fact":
         raw = get_redis().hget(f"{REDIS_PREFIX}:facts", key)
         if raw:
-            parsed = json.loads(raw)
+            parsed = json.loads(raw)  # type: ignore[arg-type]
             parsed["last_reinforced_at"] = datetime.now().isoformat()
             get_redis().hset(f"{REDIS_PREFIX}:facts", key, json.dumps(parsed))
         else:
@@ -733,8 +759,8 @@ def reinforce(key: str, layer: str = "fact") -> str:
         try:
             result = collection.get(ids=[key], include=["metadatas"])
             if result["ids"]:
-                meta = result["metadatas"][0]
-                meta["last_reinforced_at"] = datetime.now().isoformat()
+                meta = result["metadatas"][0]  # type: ignore[index]
+                meta["last_reinforced_at"] = datetime.now().isoformat()  # type: ignore[index]
                 collection.update(ids=[key], metadatas=[meta])
             else:
                 return f"Memory not found: {key}"
@@ -767,7 +793,7 @@ def sleep() -> str:
     try:
         raw_facts = get_redis().hgetall(f"{REDIS_PREFIX}:facts")
         pipe = get_redis().pipeline()
-        for k, v in raw_facts.items():
+        for k, v in raw_facts.items():  # type: ignore[union-attr]
             parsed = json.loads(v)
             last_reinforced = parsed.get(
                 "last_reinforced_at", parsed.get("updated_at", "")
@@ -798,26 +824,24 @@ def sleep() -> str:
             meta = all_data["metadatas"][i] if all_data["metadatas"] else {}
             last_reinforced = meta.get("last_reinforced_at", meta.get("date", ""))
             stored_vol = _get_volume("semantic", doc_id)
-            eff_vol = _effective_volume("semantic", doc_id, last_reinforced)
+            eff_vol = _effective_volume("semantic", doc_id, last_reinforced)  # type: ignore[arg-type]
 
             if eff_vol < stored_vol - 0.01:
                 pipe.zadd(
                     VOLUME_INDEX_KEY,
                     {_zset_key("semantic", doc_id): max(MIN_VOLUME, eff_vol)},
                 )
-                meta["last_reinforced_at"] = now.isoformat()
+                meta["last_reinforced_at"] = now.isoformat()  # type: ignore[index]
                 chroma_updates_ids.append(doc_id)
                 chroma_updates_metas.append(meta)
                 stats["semantic"] += 1
 
         pipe.execute()
         if chroma_updates_ids:
-            try:
+            with contextlib.suppress(Exception):
                 collection.update(
                     ids=chroma_updates_ids, metadatas=chroma_updates_metas
                 )
-            except Exception:
-                pass
     except Exception:
         pass
 
@@ -827,10 +851,10 @@ def sleep() -> str:
             VOLUME_INDEX_KEY, "-inf", "+inf", withscores=True
         )
         pipe = get_redis().pipeline()
-        for entry_key, score in all_doc_entries:
+        for entry_key, score in all_doc_entries:  # type: ignore[union-attr]
             if entry_key.startswith("doc:"):
                 last_r = get_redis().hget(f"{REDIS_PREFIX}:doc_reinforced", entry_key)
-                eff_vol = _effective_volume("doc", entry_key[4:], last_r)
+                eff_vol = _effective_volume("doc", entry_key[4:], last_r)  # type: ignore[arg-type]
                 if eff_vol < score - 0.01:
                     pipe.zadd(VOLUME_INDEX_KEY, {entry_key: max(MIN_VOLUME, eff_vol)})
                     pipe.hset(
@@ -877,10 +901,10 @@ def export_identity() -> str:
         all_entries = get_redis().zrangebyscore(
             VOLUME_INDEX_KEY, "-inf", "+inf", withscores=True
         )
-        for entry_key, score in all_entries:
+        for entry_key, score in all_entries:  # type: ignore[union-attr]
             identity["volumes"][entry_key] = round(score, 4)
 
-        scores = [s for _, s in all_entries]
+        scores = [s for _, s in all_entries]  # type: ignore[union-attr]
         if scores:
             scores.sort(reverse=True)
             identity["stats"] = {
@@ -944,7 +968,7 @@ def import_identity(path: str = "") -> str:
 # Internal Query Socket (for memory-inject.py hook)
 # ===================================================================
 
-QUERY_SOCKET = Path("/tmp/opencode-memory-query.sock")
+QUERY_SOCKET = Path(os.environ.get("OPENCODE_MEMORY_SOCKET", "/tmp/opencode-memory-query.sock"))
 _fact_embed_cache: dict | None = None
 _fact_embed_lock = threading.Lock()
 
@@ -957,7 +981,7 @@ def _build_fact_embeddings() -> dict | None:
             return None
 
         keys, values, texts = [], [], []
-        for key, raw in raw_facts.items():
+        for key, raw in raw_facts.items():  # type: ignore[union-attr]
             try:
                 parsed = json.loads(raw)
                 value = parsed.get("value", "")
@@ -1047,7 +1071,7 @@ def _search_semantic_memories(query_embedding: np.ndarray, n: int = 5) -> list[d
 
         memories = []
         for i, doc in enumerate(results["documents"][0]):
-            dist = results["distances"][0][i]
+            dist = results["distances"][0][i]  # type: ignore[index]
             meta = results["metadatas"][0][i] if results["metadatas"] else {}
             vol = volumes[i] if volumes[i] is not None else 40.0
             sim = 1.0 - dist
@@ -1108,13 +1132,11 @@ def _handle_hook_query(conn: _socket.socket):
         )
         conn.sendall(response.encode() + b"\n")
     except Exception as e:
-        try:
+        with contextlib.suppress(Exception):
             conn.sendall(
                 json.dumps({"error": str(e), "facts": [], "semantic": []}).encode()
                 + b"\n"
             )
-        except Exception:
-            pass
     finally:
         conn.close()
 
