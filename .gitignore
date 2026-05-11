@@ -1,3 +1,8 @@
+# Allowlist policy:
+#   This repo tracks SOURCE only (code, config templates, docs).
+#   Generated runtime state lives in ~/.config/opencode/memory/ and is NEVER committed.
+#   Exception: uv.lock is committed for reproducible installs.
+
 # Python
 .venv/
 __pycache__/
@@ -27,5 +32,3 @@ Thumbs.db
 *.swp
 *.swo
 
-# uv
-uv.lock

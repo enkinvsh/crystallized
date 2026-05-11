@@ -1,0 +1,10 @@
+{
+  "include": ["server.py", "memory-inject.py", "own-voice.py"],
+  "exclude": ["**/__pycache__", "**/.venv", "tests"],
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "basic",
+  "reportMissingTypeStubs": false,
+  "reportUnknownMemberType": false,
+  "reportUnknownVariableType": false,
+  "reportUnknownArgumentType": false
+}
