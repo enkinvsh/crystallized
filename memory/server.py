@@ -660,12 +660,22 @@ def recall(query: str, n_results: int = 5) -> str:
 def memory_context() -> str:
     """Get a compact snapshot of everything in memory — for orientation.
     Call this at the start of a session to understand what the agent
-    already knows. Returns fact keys, memory count with recent tags,
-    and document folder/file listing. Content is NOT included (use
-    recall, search_memory, or read_doc to get details).
+    already knows. Returns fact keys with short value previews, memory
+    count with recent tags, and a per-folder document summary. Long fact
+    values are truncated to a single-line preview; documents are listed
+    one line per folder with a name teaser (use recall, list_facts,
+    search_memory, list_docs, or read_doc to get full content).
 
     No arguments needed.
     """
+
+    def _preview(value: str, limit: int = 160) -> str:
+        single_line = value.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+        if len(single_line) <= limit:
+            return single_line
+        hidden = len(single_line) - limit
+        return single_line[:limit] + f"… [+{hidden} chars, recall/list_facts for full]"
+
     sections = []
 
     try:
@@ -674,7 +684,7 @@ def memory_context() -> str:
             fact_lines = []
             for k, v in sorted(raw_facts.items()):
                 parsed = json.loads(v)
-                fact_lines.append(f"  {k}: {parsed['value']}")
+                fact_lines.append(f"  {k}: {_preview(str(parsed['value']))}")
             sections.append(f"Facts ({len(raw_facts)}):\n" + "\n".join(fact_lines))
         else:
             sections.append("Facts: (none)")
@@ -713,10 +723,14 @@ def memory_context() -> str:
                 docs = sorted(f.stem for f in folder.glob("*.md"))
                 if docs:
                     total_docs += len(docs)
-                    doc_lines.append(f"  {folder.name}/")
-                    for doc in docs:
-                        doc_lines.append(f"    {doc}")
+                    teaser = docs[:3]
+                    names = ", ".join(teaser)
+                    remaining = len(docs) - len(teaser)
+                    if remaining > 0:
+                        names += f", +{remaining} more"
+                    doc_lines.append(f"  {folder.name}/ ({len(docs)} docs): {names}")
         if doc_lines:
+            doc_lines.append("  (use list_docs(folder) for full listing, read_doc to open)")
             sections.append(f"Documents ({total_docs}):\n" + "\n".join(doc_lines))
         else:
             sections.append("Documents: (none)")

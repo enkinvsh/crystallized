@@ -27,6 +27,8 @@ Stabilization release prepared for maintainer tagging after merge.
 - Pinned the opencode plugin configuration so installs use the intended plugin source.
 - Made the installer back up an existing `opencode.json` before writing Crystallized configuration.
 - Clarified installer output when Redis is already running instead of treating an existing instance as a problem.
+- Trimmed long fact values in `memory_context` to single-line previews so the snapshot stays compact.
+- Summarized documents in `memory_context` one line per folder with a name teaser instead of listing every document.
 
 ### Fixed
 
