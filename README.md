@@ -4,8 +4,9 @@
   <strong>Memory that grows. Identity that forms. Auth that works.</strong>
   <br><br>
   <a href="#quick-start">Quick Start</a> ·
-  <a href="#why-this-exists">Why</a> ·
+  <a href="#why-opencode-flags-third-party-clients-and-how-crystallized-fixes-it">Why</a> ·
   <a href="#how-it-works">How</a> ·
+  <a href="#faq">FAQ</a> ·
   <a href="#troubleshooting">Troubleshooting</a> ·
   <a href="README.ru.md">Русский</a>
 </p>
@@ -19,7 +20,9 @@
 
 ---
 
-Persistent memory, growing identity, and first-party Anthropic authentication for [opencode](https://opencode.ai). One command setup.
+# Crystallized — persistent memory and identity for opencode
+
+Crystallized is a persistent memory MCP server for [opencode](https://opencode.ai), the AI coding agent — it gives your agent long-term memory across sessions. It combines three storage layers — Redis facts, ChromaDB semantic vector search, and markdown documents — under power-law memory decay, so important context stays loud while old noise fades and nothing is deleted. On top of memory it forms an evolving agent identity and ships first-party Anthropic authentication, letting you use your Claude Max plan in opencode without third-party client detection.
 
 ## What you get
 
@@ -104,7 +107,7 @@ If something breaks, run `./uninstall.sh`, then re-run `./install.sh`.
 
 See [CHANGELOG.md](CHANGELOG.md) for full release notes.
 
-## Why this exists
+## Why opencode flags third-party clients (and how Crystallized fixes it)
 
 Anthropic detects third-party clients and routes their API calls to a separate $200 credit pool instead of your Max subscription. Community auth plugins obtain OAuth tokens with a third-party `client_id`, so every request gets flagged.
 
@@ -112,7 +115,7 @@ Crystallized extracts tokens directly from Claude.app. These carry Claude's own 
 
 ## How it works
 
-### Memory
+### Three-layer memory architecture (Redis + ChromaDB + filesystem)
 
 `memory-inject.py` runs as a pre-prompt hook on every message. It searches all three layers for relevant context and prepends it:
 
@@ -169,6 +172,42 @@ security unlock-keychain ~/Library/Keychains/login.keychain-db
 ```
 
 **Linux**, auth extraction is macOS-only (Claude.app). Bring tokens from a Mac, use an API key directly, or accept third-party routing.
+
+## Development
+
+The memory server is a standalone Python package managed with [uv](https://astral.sh). Run the test suite (67 pytest tests covering facts, semantic search, decay, and identity):
+
+```sh
+cd memory && uv run pytest tests/ -q
+```
+
+Lint with ruff before sending a change:
+
+```sh
+uv run ruff check .
+```
+
+Release notes live in [CHANGELOG.md](CHANGELOG.md); the threat model and disclosure policy live in [SECURITY.md](SECURITY.md).
+
+## FAQ
+
+**Does opencode forget context between sessions?**
+By default, yes — each session starts cold. Crystallized fixes this: it persists facts, semantic memories, and documents to disk and re-injects the relevant ones into every prompt, so the agent carries long-term memory across sessions.
+
+**Will this work with other MCP clients, or only opencode?**
+The memory server is a standard [Model Context Protocol](https://modelcontextprotocol.io) server, so any MCP client can connect to it. The installer, pre-prompt hooks, and identity injection are tailored to opencode, so other clients get the memory tools but not the automatic context injection.
+
+**Is my data sent anywhere?**
+No. Memory lives entirely on your machine — Redis, ChromaDB, and markdown files on local disk. There is no telemetry, no analytics, and no remote logging. See [SECURITY.md](SECURITY.md) for the full threat model.
+
+**Why does Anthropic route opencode to a $200 credit pool?**
+Anthropic detects third-party clients by their OAuth `client_id` and bills them against a separate credit pool instead of your subscription. Crystallized extracts first-party tokens from Claude.app, so opencode is treated as first-party and your Claude Max plan limits apply normally.
+
+**Does memory grow unbounded?**
+No. Memory decays on a power-law schedule: entries get quieter over time unless they are reinforced. Nothing is ever deleted — old noise just stops surfacing while important context stays loud.
+
+**Is there Windows support?**
+No. Crystallized targets macOS (primary) and Linux. WSL is untested, and auth extraction depends on macOS Keychain.
 
 ## License
 
