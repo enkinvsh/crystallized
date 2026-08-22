@@ -1,313 +1,156 @@
-<p align="center">
-  <code>c r y s t a l l i z e d</code>
-  <br><br>
-  <strong>Self-evolving causal memory. Bi-temporal beliefs. First-party authentication.</strong>
-  <br><br>
-  <a href="#quick-start">Quick Start</a> .
-  <a href="#architecture">Architecture</a> .
-  <a href="#memory-hierarchy">Memory Hierarchy</a> .
-  <a href="#authentication">Authentication</a> .
-  <a href="#mcp-tools">MCP Tools</a> .
-  <a href="#troubleshooting">Troubleshooting</a> .
-  <a href="README.ru.md">Русский</a>
-</p>
+# 🧠 Crystallized v2.0
 
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
-  <img src="https://img.shields.io/badge/version-2.0.0-success.svg" alt="Version 2.0.0">
-  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg" alt="Platform">
-  <img src="https://img.shields.io/badge/python-3.11%2B-3776AB.svg" alt="Python 3.11+">
-  <img src="https://img.shields.io/badge/MCP-compatible-00CED1.svg" alt="MCP">
-</p>
+> **Самообучающаяся память и вечный контекст для твоих ИИ-агентов.**  
+> Никакого Redis, никаких облаков. 100% локально, быстро и на чистом SQLite.
 
-***
-
-# Crystallized v2.0
-
-Crystallized is a persistent memory MCP server built for [opencode](https://opencode.ai). It gives your coding agent continuous long-term recall, evolving self-identity, and reliable first-party authentication across sessions.
-
-Standard agent sessions start completely cold. Crystallized changes this by capturing real workflow friction, distilling raw traces into causal principles, and automatically injecting relevant context into every prompt.
-
-**v2.0 runs with zero external infrastructure.** No Redis instances, no background broker services, and no cloud dependencies. The entire system is powered by a single SQLite database running in WAL mode alongside local markdown files.
-
-```
-+-------------------------------------------------------------------------+
-|                               USER PROMPT                               |
-+------------------------------------+------------------------------------+
-                                     |
-                                     v
-+-------------------------------------------------------------------------+
-| PRE-PROMPT HOOKS (memory-inject.py + own-voice.py)                      |
-| * Injects active beliefs, facts, and past causal lessons                |
-| * Injects agent self-voice, current focus, and observations            |
-+------------------------------------+------------------------------------+
-                                     |
-                                     v
-+-------------------------------------------------------------------------+
-| AGENT EXECUTION (opencode + MCP tools)                                  |
-| * Reads/writes facts, docs, and beliefs via standard MCP tools          |
-| * Runs sub-millisecond observer hook on every tool result               |
-+------------------------------------+------------------------------------+
-                                     |
-                                     v
-+-------------------------------------------------------------------------+
-| CAUSAL OBSERVATION (observer.py)                                        |
-| * PostToolUse / Stop hooks capture friction without blocking execution  |
-| * Appends Layer 0 raw traces to SQLite WAL                              |
-+------------------------------------+------------------------------------+
-                                     |
-                                     v
-+-------------------------------------------------------------------------+
-| NIGHTLY DREAM CONSOLIDATION (dream.py @ 04:00)                          |
-| * L0 Traces -> L1 Episodes -> L2 Patterns -> L3 Axioms                  |
-| * Bi-temporal belief reconciliation + power-law memory decay            |
-+-------------------------------------------------------------------------+
-```
+[![Лицензия: MIT](https://img.shields.io/badge/Лицензия-MIT-blue.svg)](LICENSE)
+[![Версия](https://img.shields.io/badge/Версия-2.0.0-success.svg)](https://github.com/enkinvsh/crystallized)
+[![Платформа](https://img.shields.io/badge/Платформа-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB.svg)](#)
 
 ---
 
-## Core Capabilities
+## 😫 Знакомая боль: «День сурка» у нейросетей
 
-- **Zero-Redis, 100% SQLite WAL**: Single file database at `~/.config/opencode/memory/memory.db`. Instant startup, crash-safe concurrency, zero services to babysit.
-- **Hierarchical Causal Memory**: Promotes raw tool traces (L0) through episodes (L1) and recurring patterns (L2) into high-level axioms (L3).
-- **Bi-Temporal Belief State**: Tracks both system-validity time and assertion time. Contradictions are resolved cleanly by superseding stale records without deleting history.
-- **Sub-Millisecond Observer Hook**: `observer.py` matches friction patterns against tool outputs and transcripts with a strict execution budget, ensuring the agent is never delayed.
-- **Nightly Dream Engine**: `dream.py` runs nightly consolidation to prune noise, recalculate power-law volume decay, and synthesize fresh principles.
-- **First-Party Authentication**: Extracts real OAuth tokens from Claude Desktop on macOS and Windows, bypassing broken web PKCE flows and avoiding third-party credit throttling.
+Ты запускаешь новую сессию с ИИ-агентом (в OpenCode, Claude Code или Cursor), и начинается классика:
+1. **Амнезия**: он снова не помнит твой стиль, твои любимые библиотеки и структуру проекта.
+2. **Одни и те же грабли**: ты уже 10 раз говорил ему *«не трогай этот конфиг»* и *«пиши кратко»*, но в новой сессии он снова делает по-своему.
+3. **Бесполезный RAG**: обычные векторные базы забиваются мусором и вытаскивают старые противоречащие советы трехмесячной давности.
 
----
-
-## Architecture
-
-Crystallized structures memory into three complementary storage layers:
-
-| Layer | Engine | Primary Function |
-|---|---|---|
-| **Facts & Beliefs** | SQLite (WAL) | Instant key/value facts, bi-temporal belief states, volume decay maps. |
-| **Semantic Recall** | ChromaDB | Meaning-based vector search across conversational memories. |
-| **Structured Documents** | Local Filesystem | Long-form markdown notes, architecture guides, checklists, identity files. |
-
-```
-~/.config/opencode/
-|-- opencode.json                    # MCP registrations and plugin definitions
-`-- memory/
-    |-- memory.db                    # Unified SQLite database (WAL mode)
-    |-- server.py                    # MCP server exposing memory and belief tools
-    |-- db.py                        # SQLite schema, bi-temporal tables, migrations
-    |-- volume.py                    # Power-law memory decay implementation
-    |-- observer.py                  # Fast hook for PostToolUse and Stop events
-    |-- patterns.py                  # Friction and correction pattern matchers
-    |-- dream.py                     # Dream consolidation and causal distillation
-    |-- memory-inject.py             # Pre-prompt context retrieval hook
-    |-- own-voice.py                 # Pre-prompt identity retrieval hook
-    |-- chroma_db/                   # Local vector storage
-    `-- notes/                       # Markdown storage
-        |-- architecture/
-        `-- self/
-            |-- beliefs.md
-            |-- focus.md
-            `-- observations.md
-```
+**Crystallized решает эту проблему раз и навсегда.**
 
 ---
 
-## Memory Hierarchy
+## ⚡ Как это работает (простыми словами)
 
-Raw experience undergoes continuous distillation. The progression turns isolated errors into generalized rules:
+Представь, что у твоего ИИ-ассистента наконец-то появился настоящий мозг, который работает как у человека:
 
 ```
-[ L3: Axiom / Principle ]      "Always run migrations before starting worker daemons"
-           ^
-           | (Distillation & clustering across episodes)
-[ L2: Recurring Pattern ]      "Worker crashes with MissingColumnError on deployment"
-           ^
-           | (Session transition & root-cause extraction)
-[ L1: Episode ]                "Postgres migration was skipped during hotfix deploy"
-           ^
-           | (Observer hook captures tool friction signal)
-[ L0: Raw Observation ]        "Error: column 'session_id' does not exist in table 'jobs'"
+                  ┌─────────────────────────────────────────┐
+                  │    ТЫ РАБОТАЕШЬ С АГЕНТОМ В СЕССИИ      │
+                  │  (пишешь код, даешь задачи, ругаешься)  │
+                  └────────────────────┬────────────────────┘
+                                       │
+                                       ▼
+                  ┌─────────────────────────────────────────┐
+                  │        👁️ НАБЛЮДАТЕЛЬ (Observer)        │
+                  │   Молниеносно (<1мс) замечает отказы,   │
+                  │  правки и фразы «не делай так больше»   │
+                  └────────────────────┬────────────────────┘
+                                       │
+                                       ▼
+                  ┌─────────────────────────────────────────┐
+                  │         💤 ФАЗА СНА (Dream Engine)      │
+                  │ Ночью (в 04:00) переваривает весь опыт, │
+                  │  удаляет мусор и выводит четкие правила │
+                  └────────────────────┬────────────────────┘
+                                       │
+                                       ▼
+                  ┌─────────────────────────────────────────┐
+                  │        📜 РЕЕСТР ПРАВИЛ (Beliefs)       │
+                  │   Новые правила вытесняют старые.       │
+                  │  Никакой каши и устаревших советов!     │
+                  └────────────────────┬────────────────────┘
+                                       │
+                                       ▼
+                  ┌─────────────────────────────────────────┐
+                  │       ⚡ АВТО-ИНЪЕКЦИЯ В КОНТЕКСТ        │
+                  │ При старте новой сессии агент УЖЕ знает │
+                  │     все правила и твой стиль с 1-й секунды │
+                  └─────────────────────────────────────────┘
 ```
 
-1. **L0 (Raw Observation)**: Captured live by `observer.py` during `PostToolUse` and `Stop` hooks when a command fails or a correction is made.
-2. **L1 (Episode)**: Grouped sequence of actions connecting a trigger, an attempted remedy, and an outcome within a session.
-3. **L2 (Pattern)**: Recurring theme detected across multiple sessions indicating common pitfalls or specific project traits.
-4. **L3 (Axiom)**: High-confidence decision rule stored in the bi-temporal `belief_state` table and reflected in `beliefs.md`.
+1. **Наблюдатель на лету (Observer)**: Когда ты говоришь *«нет, верни как было»*, *«я же просил Vitest, а не Jest»* или отменяешь команду, наблюдатель тихо и без тормозов фиксирует причину и следствие.
+2. **Ночная консолидация (Dream Engine)**: Раз в сутки фоновый процесс сжимает сотни мелких логов в **железные правила** (аксиомы).
+3. **Умное вытеснение (Supersession)**: Если месяц назад ты просил использовать библиотеку А, а вчера сказал перейти на Б — старое правило гасится, а новое становится активным. Агент никогда не будет путать старое с новым.
+4. **Затухание по закону памяти (Power-law Decay)**: Важные и часто используемые знания остаются громкими. Случайные одноразовые факты со временем плавно затихают.
 
 ---
 
-## Quick Start
+## 🚀 Быстрый старт за 1 минуту
 
-### Installation
+### Установка на macOS / Linux:
 
-Clone the repository and run the setup script:
+Открой терминал и выполни:
 
 ```bash
-# Ensure Claude Desktop is quit before running (Cmd+Q on macOS)
 git clone https://github.com/enkinvsh/crystallized.git
 cd crystallized
 ./install.sh
-opencode
 ```
 
-Test what will happen beforehand using the dry-run flag:
-
-```bash
-./install.sh --dry-run
-```
-
-### What install.sh Handles
-
-1. Verifies prerequisites: `git`, `python3` (3.11+), and `curl`.
-2. Installs `uv` for reproducible Python package management if missing.
-3. Installs the `opencode` CLI binary if needed.
-4. Copies memory engine files to `~/.config/opencode/memory/` and writes `.crystallized-manifest`.
-5. Syncs dependencies into an isolated virtual environment via `uv sync --frozen`.
-6. Initializes the SQLite schema (`memory.db`) with WAL mode.
-7. Seeds initial identity files (`beliefs.md`, `focus.md`, `observations.md`).
-8. Merges the memory MCP configuration into `~/.config/opencode/opencode.json`.
-9. Registers hooks in `~/.claude/settings.json` without modifying existing third-party hooks.
-10. Deploys the nightly consolidation job (`launchd` on macOS, `cron` on Linux).
-11. Runs first-party token extraction on macOS.
-
-### Installer Flags
-
-| Flag | Description |
-|---|---|
-| `--dry-run` | Prints all planned filesystem actions without making changes. |
-| `--no-hooks` | Skips hook registration in `~/.claude/settings.json`. |
-| `--no-daemon` | Skips installing the nightly dream consolidation daemon. |
-| `--offline` | Disallows network downloads, requiring local prerequisites. |
-| `--help`, `-h` | Shows available options and exits. |
+**Что скрипт сделает сам:**
+- Проверит окружение и подтянет изолированный виртуальный venv через `uv`.
+- Создаст чистую базу данных SQLite в `~/.config/opencode/memory/memory.db`.
+- Зарегистрирует авто-хуки в `~/.claude/settings.json` и подключит MCP в `opencode.json`.
+- Настроит фоновую ночную службу `launchd` (на macOS) или `cron` (на Linux).
+- Безопасно достанет авторизацию из официального Claude Desktop.
 
 ---
 
-## Authentication
+## 🔑 Вход через Claude Pro/Max (без API-ключей и переплат)
 
-When using an Anthropic subscription (Claude Pro or Max) inside opencode, standard PKCE web login flows often break or trigger third-party client flags. Anthropic inspects request headers, routing unrecognized clients to a separate credit pool or returning HTTP 429 errors.
+Если у тебя есть обычная подписка **Claude Pro** или **Claude Max**, тебе не нужно платить за API отдельно.
 
-Crystallized extracts first-party OAuth tokens directly from Claude Desktop. These tokens carry genuine client credentials. When combined with the `@thehugeman/opencode-anthropic-auth-community` plugin, outgoing requests pass all client checks.
+Crystallized умеет забирать официальный токен прямо из установленного приложения **Claude Desktop**:
 
-```
-+---------------------+      +---------------------+      +---------------------+
-|   Claude Desktop    | ---> | auth/extract_token  | ---> |   opencode auth     |
-| (Encrypted Storage) |      | (Keychain / DPAPI)  |      |   (~/.local/share)  |
-+---------------------+      +---------------------+      +---------------------+
-```
-
-### macOS Token Extraction
-On macOS, tokens are encrypted with Electron safeStorage (AES-128-CBC) using a password in the system Keychain:
-
+### На macOS:
 ```bash
-# 1. Log in to Claude.app
-# 2. Quit Claude.app completely (Cmd+Q)
-# 3. Run the extractor
 python3 auth/extract_token.py
 ```
+*(Скрипт достанет ключ из Keychain macOS и расшифрует локальный токен)*
 
-### Windows Token Extraction
-On Windows, tokens are protected by a two-layer encryption scheme (DPAPI master key + AES-256-GCM payload):
-
+### На Windows:
 ```powershell
-# 1. Log in to Claude Desktop for Windows
-# 2. Quit Claude.exe completely
-# 3. Run the extractor
 python auth\extract_token.py
 ```
+*(Скрипт расшифрует мастер-ключ через Windows DPAPI и достанет токен)*
 
-For complete platform details, troubleshooting steps, and non-interactive usage flags, consult the [Authentication Guide](docs/AUTHENTICATION.md).
-
----
-
-## MCP Tools
-
-Crystallized provides a comprehensive suite of tools for agents and developers:
-
-### Facts & Beliefs
-- `memory_save_fact(key, value, ttl_days)`: Save a key/value fact with optional expiration.
-- `memory_get_fact(key)`: Retrieve a fact by exact key with automatic volume reinforcement.
-- `memory_list_facts(prefix, limit, full)`: List facts matching a prefix.
-- `memory_delete_fact(key)`: Remove a fact.
-- `memory_belief_assert(id, subject, predicate, object_val, confidence)`: Assert a belief, atomically superseding prior active states.
-- `memory_belief_get_active(subject, predicate)`: Fetch the currently active belief.
-- `memory_belief_list_active(subject)`: List all active beliefs for a domain.
-
-### Semantic Memory & Documents
-- `memory_remember(text, tags)`: Save descriptive text to ChromaDB for semantic vector retrieval.
-- `memory_recall(query, n_results)`: Unified search across facts, vector memories, and markdown documents.
-- `memory_save_doc(folder, name, content)`: Save a structured markdown document.
-- `memory_read_doc(folder, name)`: Read a markdown document.
-- `memory_list_docs(folder)`: List available documents.
-- `memory_delete_doc(folder, name)`: Remove a document.
-
-### Causal & Maintenance
-- `memory_causal_log(id, text, layer, cause, effect, confidence)`: Record an episodic transition.
-- `memory_causal_list(layer, session_id, limit)`: Query causal memories by abstraction layer.
-- `memory_memory_context(project)`: Fast overview of active beliefs, salient facts, and recent notes.
-- `memory_reinforce(key, layer)`: Manually boost an item's volume score.
-- `memory_sleep()`: Trigger a decay and consolidation cycle manually.
+> 🔒 **100% Безопасность**: твои токены и пароли никуда не отправляются. Всё происходит строго на твоем компьютере.  
+> Подробная инструкция: [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md).
 
 ---
 
-## Nightly Dream Consolidation
+## 📂 Где всё лежит и как устроено
 
-The dream engine (`dream.py`) runs at 04:00 every night. It performs three critical maintenance jobs:
+Вся система полностью прозрачна и хранится в папке `~/.config/opencode/memory/`:
 
-1. **Power-Law Volume Decay**:
-   Memory strength decays according to:
-   $$V_{\text{eff}} = V_{\text{stored}} \cdot \left(1 + \frac{t_{\text{hours}}}{\tau}\right)^{-\alpha}$$
-   Frequent recall boosts volume, while unreferenced noise gently fades toward the floor value of `0.01`. Nothing is ever deleted.
-2. **Causal Promotion**:
-   Clusters related L0 observations into L1 episodes, extracts recurring L2 patterns, and updates L3 belief state records.
-3. **Identity Sync**:
-   Writes the highest-confidence beliefs and focus points into `~/.config/opencode/memory/notes/self/` so pre-prompt hooks load them instantly.
-
----
-
-## Uninstalling
-
-To clean up Crystallized:
-
-```bash
-./uninstall.sh            # Prompts before removing database and notes
-./uninstall.sh --keep-data # Removes code and hooks, preserves memory.db and notes
-./uninstall.sh --purge     # Removes everything without prompting
+```
+~/.config/opencode/memory/
+├── memory.db          # Единая быстрая база SQLite (факты, уроки, правила)
+├── notes/             # Твои документы, чеклисты и заметки в обычном Markdown
+├── server.py          # Локальный сервер MCP (21 инструмент для агента)
+├── observer.py        # Перехватчик правок (<150мс, не тормозит чат)
+├── dream.py           # Ночной сборщик опыта и оптимизатор базы
+└── volume.py          # Математика забывания лишнего
 ```
 
-`uninstall.sh` uses `.crystallized-manifest` to remove only installed files, ensuring any personal scripts or extra documents in the directory remain untouched.
+Никаких фоновых демонов Redis, которые жрут память, падают и требуют перезапуска. Всё крутится вокруг одного надежного файла базы данных с мгновенным откликом (WAL mode).
 
 ---
 
-## Troubleshooting
+## 🛠️ Что умеет твой агент (MCP-инструменты)
 
-### API Returns HTTP 429
-The `@thehugeman/opencode-anthropic-auth-community` plugin must be present in `opencode.json`. Verify the file contains:
-```json
-{
-  "plugin": ["@thehugeman/opencode-anthropic-auth-community@latest"]
-}
-```
+Когда Crystallized подключен, агент получает набор сверхспособностей:
 
-### Memory MCP Status is Red
-Check that the SQLite database initializes cleanly:
-```bash
-cd ~/.config/opencode/memory
-.venv/bin/python -c "import db; db.init_schema(); print('Database initialized')"
-```
-
-### Observer Hooks Not Firing
-Verify hook registrations in `~/.claude/settings.json`:
-```bash
-python3 -c "import json, os; print(json.load(open(os.path.expanduser('~/.claude/settings.json')))['hooks'].keys())"
-```
-If missing, run `./install.sh` again to safely merge the configuration.
-
-### Missing Token on Windows / macOS
-1. Open Claude Desktop and confirm you are signed in.
-2. Quit Claude Desktop completely so local files are written.
-3. Re-run `python3 auth/extract_token.py` (or `python auth\extract_token.py`).
+* **`memory_save_fact` / `memory_get_fact`**: моментально сохранить или прочитать точный факт (название сервера, порт, выбор фреймворка).
+* **`memory_belief_assert` / `memory_belief_get_active`**: записать жесткое правило поведения с автоматической отменой старого.
+* **`memory_causal_log` / `memory_causal_list`**: просмотреть цепочки причин и следствий («почему мы отказались от X в пользу Y»).
+* **`memory_save_doc` / `memory_read_doc`**: сохранять и читать полноценные архитектурные документы в папках.
+* **`memory_recall`**: гибридный умный поиск по всем фактам, документам и смысловым векторам сразу.
+* **`memory_memory_context`**: моментальный срез всего, что агент помнит на текущую секунду.
 
 ---
 
-## License
+## 💻 Переезд на новый ноутбук за 10 секунд
 
-[MIT](LICENSE)
+Если ты купил новый Mac или пересел на другой компьютер:
+1. Забери свой файл `memory.db` и папку `notes/`.
+2. Склонируй репозиторий и запусти `./install.sh`.
+3. Готово! Твой агент просыпается на новой машине с тем же накопленным опытом, характером и знаниями.
+
+---
+
+## 📄 Лицензия
+
+MIT License. Делай что хочешь, используй в личных проектах и на работе.

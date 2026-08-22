@@ -15,6 +15,7 @@
     }
   },
   "plugin": [
-    "oh-my-openagent@4.0.0"
+    "@ex-machina/opencode-anthropic-auth@1.8.1",
+    "oh-my-openagent@latest"
   ]
 }

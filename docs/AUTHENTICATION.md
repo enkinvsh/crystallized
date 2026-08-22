@@ -11,7 +11,7 @@ Anthropic also inspects client headers. Requests without valid first-party heade
 Extracting the token directly from Claude Desktop solves both issues:
 1. Claude Desktop authenticates through official Single Sign-On (SSO) and writes valid OAuth tokens to disk.
 2. The extracted token carries first-party credentials.
-3. When paired with the `@thehugeman/opencode-anthropic-auth-community` plugin in opencode, outgoing requests include the required Claude Code identity headers.
+3. When paired with the `@ex-machina/opencode-anthropic-auth@1.8.1` plugin in opencode, outgoing requests include the required Claude Code identity headers.
 
 ```
 +-------------------------------------------------------------+
@@ -33,7 +33,7 @@ Extracting the token directly from Claude Desktop solves both issues:
                                |
                                v
 +-------------------------------------------------------------+
-| opencode runtime + @thehugeman auth plugin                  |
+| opencode runtime + @ex-machina auth plugin                  |
 | Sends API calls with first-party headers -> Subscription tier |
 +-------------------------------------------------------------+
 ```
@@ -59,7 +59,7 @@ pip install cryptography
 If you installed Crystallized via `./install.sh`, `cryptography` is already installed inside `~/.config/opencode/memory/.venv`.
 
 ### 3. Opencode Auth Plugin
-Ensure `@thehugeman/opencode-anthropic-auth-community` is declared in your `opencode.json` configuration file:
+Ensure `@ex-machina/opencode-anthropic-auth` is declared in your `opencode.json` configuration file:
 
 - **macOS / Linux**: `~/.config/opencode/opencode.json`
 - **Windows**: `%USERPROFILE%\.config\opencode\opencode.json`
@@ -68,10 +68,29 @@ Ensure `@thehugeman/opencode-anthropic-auth-community` is declared in your `open
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "@thehugeman/opencode-anthropic-auth-community@latest"
+    "@ex-machina/opencode-anthropic-auth@1.8.1"
   ]
 }
 ```
+
+The floating tag `@ex-machina/opencode-anthropic-auth@latest` is also supported if you prefer to
+track the newest release instead of pinning to `1.8.1`.
+
+#### Anchor-Based System Prompt Sanitization
+
+Version `1.8.1` sanitizes the system prompt using **anchors** rather than truncation. The plugin
+locates known marker strings in the outgoing prompt and removes only the client-identifying
+preamble attached to them, leaving everything else byte-for-byte untouched.
+
+The practical guarantee: **100% of user instructions are preserved.**
+
+- Custom system prompts survive intact.
+- Style guides survive intact.
+- `AGENTS.md` content survives intact.
+
+Earlier truncation-based approaches could silently drop the tail of a long prompt, so instructions
+placed late in `AGENTS.md` never reached the model. Anchor-based sanitization removes that failure
+mode: nothing outside the identified preamble is rewritten, reordered, or dropped.
 
 ---
 
@@ -197,7 +216,7 @@ Sample structure written to `auth.json`:
 ## Troubleshooting
 
 ### HTTP 429 Too Many Requests
-- Cause: The `@thehugeman/opencode-anthropic-auth-community` plugin is missing or inactive.
+- Cause: The `@ex-machina/opencode-anthropic-auth` plugin is missing or inactive.
 - Fix: Add the plugin to your `opencode.json` configuration and launch opencode once so it installs the dependency.
 
 ### InvalidTag / Decryption Error
