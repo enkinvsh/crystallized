@@ -1,10 +1,7 @@
 # <img src="docs/icons/brain.svg" width="28" alt="" /> Crystallized
 
-<a href="https://github.com/sponsors/enkinvsh">
-  <img src="https://img.shields.io/badge/Sponsor-ea4aaa?style=for-the-badge&logo=github-sponsors&logoColor=white" alt="Sponsor">
-</a>
 <a href="https://web.tribute.tg/d/Huc">
-  <img src="https://img.shields.io/badge/Donate-Tribute-blue?style=for-the-badge&logo=telegram&logoColor=white" alt="Donate">
+  <img src="https://img.shields.io/badge/Sponsor-ea4aaa?style=for-the-badge&logo=github-sponsors&logoColor=white" alt="Sponsor">
 </a>
 
 <br><br>
@@ -91,8 +88,7 @@ cd crystallized
 
 Если Crystallized экономит твои нервы и время:
 
-- **[Sponsor on GitHub](https://github.com/sponsors/enkinvsh)** (официальная кнопка спонсорства)
-- **[Tribute (карты и крипта)](https://web.tribute.tg/d/Huc)**
+- [Tribute (карты и крипта)](https://web.tribute.tg/d/Huc)
 
 ---
 
