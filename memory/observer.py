@@ -259,27 +259,11 @@ def post_tool_observations(payload: dict[str, Any]) -> list[Observation]:
             )
         )
 
-    hit = patterns.detect_friction(out_text) if out_text else None
-    if hit is not None:
-        obs.append(
-            Observation(
-                text=f"friction in `{tool}` output ({hit['type']}): {hit['match']}",
-                source_ref=f"{base_ref}#friction",
-                session_id=session_id,
-                cause=f"tool_call:{tool}",
-                effect=hit["type"],
-                confidence=_damped(hit["confidence"]),
-                observed_at=str(observed_at),
-                tags=(
-                    "observer",
-                    "post-tool",
-                    "friction",
-                    hit["type"],
-                    hit["label"],
-                    f"lang:{hit['language']}",
-                ),
-            )
-        )
+    # Invariant: friction is never detected on this path. Tool output is not a
+    # user utterance, so any match here is by construction a false positive
+    # ("Stop" in TodoWrite output, "No" in a diff, "мусор" in a log line).
+    # Friction lives on --session-end. Scanning tool *input* would be valid;
+    # scanning the response is not.
     return obs
 
 

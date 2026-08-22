@@ -118,18 +118,66 @@ def decay_volume(stored: float, t_hours: float, layer: str) -> float:
     return max(MIN_VOLUME, stored * (1 + t_hours / tau) ** (-alpha))
 
 
-def decayed(stored: float, layer: str, last_reinforced_at: str | None) -> float:
+def as_local_naive(moment: datetime) -> datetime:
+    """Normalize a datetime to the naive-local convention :func:`parse_ts` uses."""
+    if moment.tzinfo is None:
+        return moment
+    return moment.astimezone().replace(tzinfo=None)
+
+
+def elapsed_hours(now: datetime, last_reinforced_at: str | None) -> float | None:
+    """Hours between a stored clock and ``now``. None when the clock is unusable."""
+    last_dt = parse_ts(last_reinforced_at)
+    if last_dt is None:
+        return None
+    return (as_local_naive(now) - last_dt).total_seconds() / 3600.0
+
+
+def decayed(
+    stored: float,
+    layer: str,
+    last_reinforced_at: str | None,
+    now: datetime | None = None,
+) -> float:
     """Apply :func:`decay_volume` using a timestamp instead of an age.
 
     An unparseable/absent clock means "never reinforced, no measurable age" and
     returns the stored value untouched — guessing an age would silently mute
     memories whose metadata is merely incomplete.
+
+    ``now`` is injectable so callers that already fixed an instant (notably
+    :func:`sleep`) measure against THAT instant instead of re-reading the wall
+    clock, which would otherwise re-charge the same interval on every call.
     """
-    last_dt = parse_ts(last_reinforced_at)
-    if last_dt is None:
+    age = elapsed_hours(now or datetime.now(), last_reinforced_at)
+    if age is None:
         return stored
-    age_hours = (datetime.now() - last_dt).total_seconds() / 3600.0
-    return decay_volume(stored, age_hours, layer)
+    return decay_volume(stored, age, layer)
+
+
+def decay_step(
+    stored: float, prev_age_hours: float, delta_hours: float, layer: str
+) -> float:
+    """Advance an ALREADY-materialized volume along the original power law.
+
+    A power law does not compose: ``f(a) * f(b) != f(a + b)``. Materializing
+    decay nightly with ``stored * f(delta)`` therefore multiplies 30 steep
+    head-of-curve factors together and forgets ~2.5x too much over a month.
+
+    Advancing by the RATIO of the true curve at the new and previous total ages
+    telescopes instead — ``f(t1)/f(t0) * f(t2)/f(t1) * ... = f(tn)/f(t0)`` — so
+    a nightly pass lands on exactly the same value as one single pass over the
+    whole elapsed period. ``prev_age_hours`` is the accumulated age already
+    charged to ``stored``; 0 means "reinforced, curve starts here".
+    """
+    if delta_hours <= 0:
+        return stored
+    alpha = DECAY_ALPHA.get(layer, FALLBACK_ALPHA)
+    tau = DECAY_TAU.get(layer, FALLBACK_TAU)
+    t_prev = max(0.0, prev_age_hours)
+    t_total = t_prev + delta_hours
+    factor = ((1 + t_total / tau) / (1 + t_prev / tau)) ** (-alpha)
+    return max(MIN_VOLUME, stored * factor)
 
 
 def clamp(volume: float) -> float:
@@ -216,6 +264,8 @@ def reinforce(
     boost = REINFORCE_BOOST * quality * (headroom / MAX_VOLUME)
     new_vol = min(current + boost, MAX_VOLUME)
     set_volume(layer, entry_id, new_vol, conn=conn)
+    # A real touch restarts the curve, so the accumulated decay age is void.
+    db.decay_anchor_delete(zset_key(layer, entry_id), conn=conn)
     if log_event is not None:
         log_event(entry_id, "recall", new_vol, layer, conn=conn)
     return new_vol
@@ -244,26 +294,57 @@ def _default_writable_update(
         db.semantic_set(doc_id, text, meta, conn=conn)
 
 
+def _advance(
+    entity_key: str,
+    layer: str,
+    stored: float,
+    last_reinforced_at: str | None,
+    now: datetime,
+    anchors: dict[str, float],
+) -> tuple[float, float] | None:
+    """One entity's materialization step, or None when there is nothing to charge.
+
+    Returns ``(new_volume, new_accumulated_age)``. The delta is measured from
+    the entity's OWN previous stamp to ``now``; the accumulated age carries the
+    curve position forward so the step never re-charges what was already paid.
+    """
+    delta = elapsed_hours(now, last_reinforced_at)
+    if delta is None or delta <= 0:
+        return None
+    prev_age = anchors.get(entity_key, 0.0)
+    eff = decay_step(stored, prev_age, delta, layer)
+    if eff >= stored - DECAY_EPSILON:
+        return None
+    return max(MIN_VOLUME, eff), prev_age + delta
+
+
 def _decay_facts(now: datetime) -> int:
     """Decay every fact and reset its reinforcement clock. Returns rows touched."""
     all_facts = db.fact_all()  # materialized
     fact_vols = db.volume_map("fact")  # materialized
+    anchors = db.decay_anchor_map()  # materialized
     default = default_for("fact")
     updates: list[tuple[str, str, float]] = []
+    anchor_updates: list[tuple[str, float]] = []
     rows: list[tuple[str, dict]] = []
     for key, parsed in all_facts.items():
+        entity_key = zset_key("fact", key)
         last_reinforced = parsed.get("last_reinforced_at", parsed.get("updated_at", ""))
-        stored = fact_vols.get(zset_key("fact", key), default)
-        eff = decayed(stored, "fact", last_reinforced)
-        if eff < stored - DECAY_EPSILON:
-            updates.append((zset_key("fact", key), "fact", max(MIN_VOLUME, eff)))
-            # Reset clock: store the decayed value, mark it reinforced now.
-            parsed["last_reinforced_at"] = now.isoformat()
-            rows.append((key, parsed))
+        stored = fact_vols.get(entity_key, default)
+        step = _advance(entity_key, "fact", stored, last_reinforced, now, anchors)
+        if step is None:
+            continue
+        eff, age = step
+        updates.append((entity_key, "fact", eff))
+        anchor_updates.append((entity_key, age))
+        # Reset clock: store the decayed value, mark it reinforced now.
+        parsed["last_reinforced_at"] = now.isoformat()
+        rows.append((key, parsed))
     if not updates:
         return 0
     with db.write_txn() as txn:
         db.volume_set_many(updates, conn=txn)
+        db.decay_anchor_set_many(anchor_updates, conn=txn)
         db.fact_set_many(rows, conn=txn)
     return len(updates)
 
@@ -280,40 +361,47 @@ def _decay_semantic(
     so it lives in the ``semantic_reinforced`` table instead of the metadata.
     """
     sem_vols = db.volume_map("semantic")  # materialized
+    anchors = db.decay_anchor_map()  # materialized
     default = default_for("semantic")
     updates: list[tuple[str, str, float]] = []
+    anchor_updates: list[tuple[str, float]] = []
     clock_updates: list[str] = []
     writable_updates: list[SemanticRow] = []
 
     if readonly_semantic is not None:
         clocks = db.semantic_reinforced_map()  # materialized: avoids N queries
         for doc_id, _text, meta in readonly_semantic():
+            entity_key = zset_key("semantic", doc_id)
             last_reinforced = (
                 clocks.get(doc_id) or meta.get("last_reinforced_at") or meta.get("date", "")
             )
-            stored = sem_vols.get(zset_key("semantic", doc_id), default)
-            eff = decayed(stored, "semantic", last_reinforced)
-            if eff < stored - DECAY_EPSILON:
-                updates.append(
-                    (zset_key("semantic", doc_id), "semantic", max(MIN_VOLUME, eff))
-                )
-                clock_updates.append(doc_id)
+            stored = sem_vols.get(entity_key, default)
+            step = _advance(entity_key, "semantic", stored, last_reinforced, now, anchors)
+            if step is None:
+                continue
+            eff, age = step
+            updates.append((entity_key, "semantic", eff))
+            anchor_updates.append((entity_key, age))
+            clock_updates.append(doc_id)
 
     for doc_id, text, meta in writable_semantic():
+        entity_key = zset_key("semantic", doc_id)
         last_reinforced = meta.get("last_reinforced_at", meta.get("date", ""))
-        stored = sem_vols.get(zset_key("semantic", doc_id), default)
-        eff = decayed(stored, "semantic", last_reinforced)
-        if eff < stored - DECAY_EPSILON:
-            updates.append(
-                (zset_key("semantic", doc_id), "semantic", max(MIN_VOLUME, eff))
-            )
-            meta["last_reinforced_at"] = now.isoformat()
-            writable_updates.append((doc_id, text, meta))
+        stored = sem_vols.get(entity_key, default)
+        step = _advance(entity_key, "semantic", stored, last_reinforced, now, anchors)
+        if step is None:
+            continue
+        eff, age = step
+        updates.append((entity_key, "semantic", eff))
+        anchor_updates.append((entity_key, age))
+        meta["last_reinforced_at"] = now.isoformat()
+        writable_updates.append((doc_id, text, meta))
 
     if not updates:
         return 0
     with db.write_txn() as txn:
         db.volume_set_many(updates, conn=txn)
+        db.decay_anchor_set_many(anchor_updates, conn=txn)
         writable_semantic_update(writable_updates, txn)
         for doc_id in clock_updates:
             db.semantic_reinforced_set(doc_id, now.isoformat(), conn=txn)
@@ -323,18 +411,24 @@ def _decay_semantic(
 def _decay_docs(now: datetime) -> int:
     """Decay docs. Their clock lives in ``doc_reinforced``, keyed ``doc:<name>``."""
     doc_vols = db.volume_map("doc")  # materialized
+    anchors = db.decay_anchor_map()  # materialized
     updates: list[tuple[str, str, float]] = []
+    anchor_updates: list[tuple[str, float]] = []
     stamps: list[str] = []
     for entity_key, stored in doc_vols.items():
         last_r = db.doc_reinforced_get(entity_key)
-        eff = decayed(stored, "doc", last_r)
-        if eff < stored - DECAY_EPSILON:
-            updates.append((entity_key, "doc", max(MIN_VOLUME, eff)))
-            stamps.append(entity_key)
+        step = _advance(entity_key, "doc", stored, last_r, now, anchors)
+        if step is None:
+            continue
+        eff, age = step
+        updates.append((entity_key, "doc", eff))
+        anchor_updates.append((entity_key, age))
+        stamps.append(entity_key)
     if not updates:
         return 0
     with db.write_txn() as txn:
         db.volume_set_many(updates, conn=txn)
+        db.decay_anchor_set_many(anchor_updates, conn=txn)
         for entity_key in stamps:
             db.doc_reinforced_set(entity_key, now.isoformat(), conn=txn)
     return len(updates)
@@ -355,6 +449,12 @@ def sleep(
     stores the decayed value and resets the clock. Memories are NEVER deleted,
     only made quieter (floor: MIN_VOLUME).
 
+    Running nightly must land on the SAME volume as running once a month: each
+    entity's step is charged as a ratio against its accumulated decay age (see
+    :func:`decay_step`), never as a fresh full-strength decay of an already
+    decayed value. ``now`` is the single instant the whole pass measures
+    against — repeating a pass with the same ``now`` is a no-op.
+
     Each layer keeps its OWN transaction and its own error boundary: a failure
     in one layer must not roll back the layers that already succeeded. Every
     layer also MATERIALIZES its rows BEFORE looping — issuing UPDATEs while a
@@ -368,7 +468,7 @@ def sleep(
 
     Returns per-layer counts plus ``total_decayed``.
     """
-    now = now or datetime.now()
+    now = as_local_naive(now or datetime.now())
     writable_semantic = writable_semantic or _default_writable_semantic
     writable_semantic_update = writable_semantic_update or _default_writable_update
 

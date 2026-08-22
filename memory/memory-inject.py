@@ -123,21 +123,65 @@ def get_semantic_count() -> int:
         return -1
 
 
-def get_doc_listing() -> tuple[list[str], int]:
+def get_doc_stats() -> tuple[int, int]:
+    """Count doc folders and docs without enumerating them.
+
+    Enumerating the folders cost 967 of 2275 injected tokens (measured
+    2026-08-22, cl100k) for a listing that is identical on every prompt and
+    reachable on demand via ``list_docs()``.
+    """
     try:
         NOTES_DIR.mkdir(parents=True, exist_ok=True)
-        lines = []
+        folders = 0
         total = 0
-        for folder in sorted(NOTES_DIR.iterdir()):
+        for folder in NOTES_DIR.iterdir():
             if not folder.is_dir():
                 continue
-            docs = sorted(f.stem for f in folder.glob("*.md"))
-            if docs:
-                total += len(docs)
-                lines.append(f"  {folder.name}/ ({len(docs)})")
-        return lines, total
+            count = sum(1 for _ in folder.glob("*.md"))
+            if count:
+                folders += 1
+                total += count
+        return folders, total
     except Exception:
-        return [], -1
+        return 0, -1
+
+
+#: Paid on every turn of every session, so it is a hard ceiling.
+MAX_INJECT_TOKENS = 1300
+
+#: Upper bound, not the folklore 0.25: this store's mixed RU/EN identifier-heavy
+#: text measures ~0.40 tokens/char under cl100k. Keeps the hook tokenizer-free.
+_TOKENS_PER_CHAR = 0.5
+
+
+def estimate_tokens(text: str) -> int:
+    return int(len(text) * _TOKENS_PER_CHAR) + 1
+
+
+TRIM_MARKER = "[Memory] (trimmed to prompt budget)"
+
+
+def fit_to_budget(sections: list[str], max_tokens: int = MAX_INJECT_TOKENS) -> list[str]:
+    """Drop trailing detail lines from the widest section until the payload fits.
+
+    Section headers are a floor: they are never dropped, so a budget too small
+    to hold them yields a header-only payload rather than an empty one. The
+    trim marker's own cost is reserved before trimming, otherwise appending it
+    would push the result back over budget.
+    """
+    sections = list(sections)
+    if estimate_tokens("\n".join(sections)) <= max_tokens:
+        return sections
+
+    budget = max_tokens - estimate_tokens("\n" + TRIM_MARKER)
+    while estimate_tokens("\n".join(sections)) > budget:
+        widest = max(range(len(sections)), key=lambda i: len(sections[i]))
+        lines = sections[widest].split("\n")
+        if len(lines) < 2:
+            break
+        sections[widest] = "\n".join(lines[:-1])
+    sections.append(TRIM_MARKER)
+    return sections
 
 
 STOPWORDS = {
@@ -334,15 +378,18 @@ def main():
     if top_entries:
         sections.append("[Memory] Loudest:\n" + "\n".join(top_entries))
 
-    doc_lines, doc_total = get_doc_listing()
+    doc_folders, doc_total = get_doc_stats()
     if doc_total > 0:
-        sections.append(f"[Memory] Docs ({doc_total}):\n" + "\n".join(doc_lines))
+        sections.append(
+            f"[Memory] Docs: {doc_total} in {doc_folders} folders "
+            "(list_docs() to browse, read_doc(folder, name) to open)"
+        )
 
     sections.append(
         "[Memory] recall(query) for deep search. save_fact/remember/save_doc to store."
     )
 
-    print("\n".join(sections))
+    print("\n".join(fit_to_budget(sections)))
 
 
 if __name__ == "__main__":

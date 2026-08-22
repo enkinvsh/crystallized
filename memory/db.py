@@ -112,9 +112,20 @@ CREATE INDEX IF NOT EXISTS idx_belief_subject ON belief_state(subject);
 CREATE INDEX IF NOT EXISTS idx_belief_status  ON belief_state(status);
 """
 
+_V3_SCHEMA_SQL = """
+-- Accumulated decay age, in hours, since the last genuine reinforcement.
+-- A power law does NOT compose: applying it per-step to an already-decayed
+-- value forgets far faster than applying it once over the total age. Keeping
+-- the running age lets sleep() advance along the ORIGINAL curve instead.
+CREATE TABLE IF NOT EXISTS decay_anchor (
+  entity_key TEXT PRIMARY KEY,
+  age_hours  REAL NOT NULL DEFAULT 0);
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: _V1_SCHEMA_SQL,
     2: _V2_SCHEMA_SQL,
+    3: _V3_SCHEMA_SQL,
 }
 
 # ---------------------------------------------------------------------------
@@ -369,6 +380,7 @@ def volume_set_many(
 
 def volume_delete(entity_key: str, conn: sqlite3.Connection | None = None) -> None:
     _exec(conn, "DELETE FROM volumes WHERE entity_key = ?", (entity_key,))
+    _exec(conn, "DELETE FROM decay_anchor WHERE entity_key = ?", (entity_key,))
 
 
 def volume_map(layer: str) -> dict[str, float]:
@@ -377,6 +389,33 @@ def volume_map(layer: str) -> dict[str, float]:
             "SELECT entity_key, volume FROM volumes WHERE layer = ?", (layer,)
         ).fetchall()
     return {row["entity_key"]: float(row["volume"]) for row in rows}
+
+
+def decay_anchor_map() -> dict[str, float]:
+    with read_conn() as c:
+        rows = c.execute("SELECT entity_key, age_hours FROM decay_anchor").fetchall()
+    return {row["entity_key"]: float(row["age_hours"]) for row in rows}
+
+
+def decay_anchor_set_many(
+    rows: list[tuple[str, float]], conn: sqlite3.Connection | None = None
+) -> None:
+    if not rows:
+        return
+    sql = (
+        "INSERT INTO decay_anchor(entity_key, age_hours) VALUES(?, ?) "
+        "ON CONFLICT(entity_key) DO UPDATE SET age_hours = excluded.age_hours"
+    )
+    params = [(ek, float(age)) for ek, age in rows]
+    if conn is not None:
+        conn.executemany(sql, params)
+        return
+    with write_txn() as c:
+        c.executemany(sql, params)
+
+
+def decay_anchor_delete(entity_key: str, conn: sqlite3.Connection | None = None) -> None:
+    _exec(conn, "DELETE FROM decay_anchor WHERE entity_key = ?", (entity_key,))
 
 
 def volume_all_sorted() -> list[tuple[str, float]]:
@@ -629,6 +668,25 @@ def causal_delete_l0_with_parent(l0_ttl_days: int = 7) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _belief_id_taken(c: sqlite3.Connection, id: str) -> bool:
+    return c.execute("SELECT 1 FROM belief_state WHERE id = ?", (id,)).fetchone() is not None
+
+
+def _belief_version_id(c: sqlite3.Connection, base_id: str) -> str:
+    """First free ``<base_id>#v<n>`` primary key.
+
+    Callers legitimately re-use an id (it is documented as "identifier for this
+    belief assertion"), but the row it named may already be parked in history as
+    a superseded version, or may belong to a different subject entirely. Minting
+    a distinct version id keeps every previous version intact instead of
+    colliding on the primary key.
+    """
+    n = 2
+    while _belief_id_taken(c, f"{base_id}#v{n}"):
+        n += 1
+    return f"{base_id}#v{n}"
+
+
 def belief_assert(
     id: str,
     subject: str,
@@ -639,24 +697,47 @@ def belief_assert(
     evidence_id: str | None = None,
     source: str = "observer",
     conn: sqlite3.Connection | None = None,
-) -> None:
-    """Assert a new active belief, atomically superseding any incumbent active belief."""
+) -> str:
+    """Assert a new active belief, atomically superseding any incumbent.
+
+    Returns the primary key the assertion actually landed on — usually ``id``,
+    but a distinct ``<id>#v<n>`` when that key was already taken by an earlier
+    version (see :func:`_belief_version_id`).
+
+    Re-asserting the id that IS the current incumbent updates that row in place:
+    superseding a row by itself would back-link ``superseded_by`` to its own id
+    and then re-insert the very primary key it just wrote.
+    """
     now_iso = datetime.now(timezone.utc).isoformat()
     v_from = valid_from or now_iso
 
-    def _do(c: sqlite3.Connection) -> None:
+    def _do(c: sqlite3.Connection) -> str:
         # Find existing active incumbent
         incumbent = c.execute(
             "SELECT id FROM belief_state WHERE subject = ? AND predicate = ? AND status = 'active'",
             (subject, predicate),
         ).fetchone()
 
-        supersedes_id = None
-        if incumbent:
-            supersedes_id = incumbent["id"]
+        # Same row re-asserted: update in place, never supersede by itself.
+        if incumbent is not None and incumbent["id"] == id:
+            c.execute(
+                "UPDATE belief_state SET object = ?, confidence = ?, valid_from = ?, "
+                "valid_to = NULL, recorded_at = ?, status = 'active', "
+                "superseded_by = NULL, evidence_id = ?, source = ? WHERE id = ?",
+                (object_val, confidence, v_from, now_iso, evidence_id, source, id),
+            )
+            return id
+
+        supersedes_id = incumbent["id"] if incumbent is not None else None
+
+        # Resolve the new row's key BEFORE superseding, so the incumbent's
+        # superseded_by back-link points at the row that actually gets written.
+        new_id = _belief_version_id(c, id) if _belief_id_taken(c, id) else id
+
+        if supersedes_id is not None:
             c.execute(
                 "UPDATE belief_state SET status = 'superseded', valid_to = ?, superseded_by = ? WHERE id = ?",
-                (v_from, id, supersedes_id),
+                (v_from, new_id, supersedes_id),
             )
 
         c.execute(
@@ -667,14 +748,14 @@ def belief_assert(
               evidence_id, source
             ) VALUES (?, ?, ?, ?, 'active', ?, ?, NULL, ?, NULL, ?, ?, ?)
             """,
-            (id, subject, predicate, object_val, confidence, v_from, now_iso, supersedes_id, evidence_id, source),
+            (new_id, subject, predicate, object_val, confidence, v_from, now_iso, supersedes_id, evidence_id, source),
         )
+        return new_id
 
     if conn is not None:
-        _do(conn)
-    else:
-        with write_txn() as c:
-            _do(c)
+        return _do(conn)
+    with write_txn() as c:
+        return _do(c)
 
 
 def belief_get_active(subject: str, predicate: str) -> dict | None:

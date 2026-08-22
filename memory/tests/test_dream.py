@@ -286,6 +286,86 @@ class TestSleep:
         assert "1 facts" in text and "6 total" in text
 
 
+class TestSleepDoesNotCompound:
+    """D5/D6: a power law does not compose, so nightly passes must telescope."""
+
+    LAYERS = ("fact", "semantic", "doc")
+
+    def _seed(self, layer: str, key: str, origin: datetime, stored: float) -> None:
+        """Place an entity on the curve as if freshly reinforced at ``origin``."""
+        db.decay_anchor_delete(volume.zset_key(layer, key))
+        volume.set_volume(layer, key, stored)
+        if layer == "fact":
+            db.fact_set(key, {"value": "v", "last_reinforced_at": origin.isoformat()})
+        elif layer == "semantic":
+            db.semantic_set(key, "text", {"last_reinforced_at": origin.isoformat()})
+        else:
+            db.doc_reinforced_set(volume.zset_key("doc", key), origin.isoformat())
+
+    @pytest.mark.parametrize("layer", LAYERS)
+    def test_thirty_nightly_passes_match_the_closed_form(self, temp_db, layer):
+        origin = datetime.now() - timedelta(days=30)
+        stored = 80.0
+        self._seed(layer, "k", origin, stored)
+
+        for day in range(1, 31):
+            volume.sleep(now=origin + timedelta(days=day))
+
+        expected = volume.decay_volume(stored, 30 * 24.0, layer)
+        assert volume.get_volume(layer, "k") == pytest.approx(expected, rel=1e-9)
+
+    @pytest.mark.parametrize("layer", LAYERS)
+    def test_many_small_passes_equal_one_big_pass(self, temp_db, layer):
+        origin = datetime.now() - timedelta(days=30)
+        end = origin + timedelta(days=30)
+        self._seed(layer, "nightly", origin, 80.0)
+        self._seed(layer, "once", origin, 80.0)
+
+        for day in range(1, 31):
+            volume.sleep(now=origin + timedelta(days=day))
+        # 'once' rode along every pass; re-seed it to measure a single jump.
+        self._seed(layer, "once", origin, 80.0)
+        volume.sleep(now=end)
+
+        assert volume.get_volume(layer, "nightly") == pytest.approx(
+            volume.get_volume(layer, "once"), rel=1e-9
+        )
+
+    def test_nightly_decay_stays_far_above_the_compounding_curve(self, temp_db):
+        """The old bug forgot ~2.5x too much over a month. Pin that it is gone."""
+        origin = datetime.now() - timedelta(days=30)
+        self._seed("fact", "k", origin, 50.0)
+        for day in range(1, 31):
+            volume.sleep(now=origin + timedelta(days=day))
+
+        compounding = 50.0
+        for _ in range(30):
+            compounding = volume.decay_volume(compounding, 24.0, "fact")
+
+        assert volume.get_volume("fact", "k") > compounding * 2
+
+    def test_repeating_a_pass_at_the_same_instant_is_a_noop(self, temp_db):
+        """D6: the `now` seam must be measured against, not just stamped."""
+        origin = datetime.now() - timedelta(days=30)
+        self._seed("fact", "k", origin, 50.0)
+        fixed = origin + timedelta(days=30)
+
+        assert volume.sleep(now=fixed)["fact"] == 1
+        after_first = volume.get_volume("fact", "k")
+        assert volume.sleep(now=fixed)["fact"] == 0
+        assert volume.sleep(now=fixed)["fact"] == 0
+        assert volume.get_volume("fact", "k") == after_first
+
+    def test_reinforcement_restarts_the_curve(self, temp_db):
+        """A genuine touch voids the accumulated age, not just the volume."""
+        origin = datetime.now() - timedelta(days=30)
+        self._seed("fact", "k", origin, 50.0)
+        volume.sleep(now=origin + timedelta(days=30))
+
+        volume.reinforce("fact", "k")
+        assert db.decay_anchor_map().get(volume.zset_key("fact", "k")) is None
+
+
 def test_server_reuses_the_shared_module(temp_db):
     """server.py must delegate, not duplicate — one decay curve, one source."""
     server = pytest.importorskip("server")
@@ -448,6 +528,70 @@ class TestPass2Compress:
         assert dream.pass2_compress(dream.pass1_ingest()["rows"])["l1"] == 0
         assert _row("m1")["parent_id"] is None
 
+    def test_a_settled_lone_record_becomes_a_singleton_episode(self, temp_db):
+        """Past the wait, no sibling is coming: promote it or starve forever."""
+        _add_l0("m1", "solitary", session="sess-a", days_ago=30)
+        stats = dream.pass2_compress(dream.pass1_ingest()["rows"])
+        assert (stats["l1"], stats["l1_singletons"]) == (1, 1)
+        assert _row("m1")["parent_id"] is not None
+
+    def test_a_lone_record_still_inside_the_wait_is_left_alone(self, temp_db):
+        """A sibling may still land tonight — promoting now would freeze it out."""
+        _add_l0("m1", "solitary", session="sess-a", days_ago=0.5)
+        stats = dream.pass2_compress(dream.pass1_ingest()["rows"])
+        assert (stats["l1"], stats["l1_singletons"]) == (0, 0)
+        assert _row("m1")["parent_id"] is None
+
+    def test_lone_records_do_not_starve_the_ingest_budget(self, temp_db):
+        """D2: orphans are the OLDEST rows, so they own the whole LIMIT window.
+
+        Before the singleton rescue they could never be parented and never be
+        deleted, so every subsequent run re-read the same dead rows and fresh
+        records were never reached — consolidation stopped, silently, forever.
+        """
+        for i in range(4):
+            _add_l0(f"orphan{i}", f"lonely {i}", session=f"solo-{i}", days_ago=30 - i)
+        _add_l0("fresh1", "x", session="pair", days_ago=0)
+        _add_l0("fresh2", "y", session="pair", days_ago=0)
+
+        first = dream.consolidate(ingest_limit=4)
+        assert first["pass1_ingest"]["scanned"] == 4
+        assert first["pass2_compress"]["l1_singletons"] == 4
+
+        second = dream.consolidate(ingest_limit=4)
+        assert second["pass1_ingest"]["scanned"] == 2
+        assert second["pass2_compress"]["l1"] == 1
+        assert _row("fresh1")["parent_id"] is not None
+
+    def test_does_not_weld_one_members_cause_to_anothers_effect(self, temp_db):
+        _add_l0("m1", "x", session="s", cause="alpha config applied", effect="alpha is live")
+        _add_l0("m2", "y", session="s", cause="beta reverted", effect="beta is gone")
+        dream.pass2_compress(dream.pass1_ingest()["rows"])
+        parent = _row(_row("m1")["parent_id"])
+        assert parent["cause"] is None
+        assert parent["effect"] is None
+
+    def test_inherits_a_pair_the_members_agree_on(self, temp_db):
+        _add_l0("m1", "x", session="s", cause="stale lock", effect="build fails")
+        _add_l0("m2", "y", session="s", cause="stale lock", effect="build fails")
+        dream.pass2_compress(dream.pass1_ingest()["rows"])
+        parent = _row(_row("m1")["parent_id"])
+        assert (parent["cause"], parent["effect"]) == ("stale lock", "build fails")
+
+    def test_a_digest_does_not_borrow_an_arbitrary_session(self, temp_db):
+        for session in ("A", "B"):
+            _add_l0(f"{session}1", "x", session=session, tags="perf")
+            _add_l0(f"{session}2", "y", session=session, tags="perf")
+        dream.pass2_compress(dream.pass1_ingest()["rows"])
+        digest = db.causal_query(layer=dream.L2_DIGEST, limit=5)[0]
+        assert digest["session_id"] is None
+
+    def test_an_episode_keeps_its_own_session(self, temp_db):
+        _add_l0("m1", "x", session="sess-a")
+        _add_l0("m2", "y", session="sess-a")
+        dream.pass2_compress(dream.pass1_ingest()["rows"])
+        assert _row(_row("m1")["parent_id"])["session_id"] == "sess-a"
+
     def test_sessionless_rows_group_by_day(self, temp_db):
         _add_l0("m1", "x", session=None, days_ago=0)
         _add_l0("m2", "y", session=None, days_ago=0)
@@ -495,7 +639,7 @@ class TestPass2Compress:
         and one digest is not yet a pattern — so no axiom is minted."""
         self._seed_night(1)
         stats = dream.pass2_compress(dream.pass1_ingest()["rows"])
-        assert stats == {"l1": 4, "l2": 2, "l3": 0}
+        assert stats == {"l1": 4, "l1_singletons": 0, "l2": 2, "l3": 0}
 
     def test_a_theme_that_recurs_across_nights_becomes_an_axiom(self, temp_db):
         """Axioms are earned by recurrence: a second night's digest on the same
@@ -506,7 +650,7 @@ class TestPass2Compress:
         self._seed_night(2)
         stats = dream.pass2_compress(dream.pass1_ingest()["rows"])
 
-        assert stats == {"l1": 4, "l2": 2, "l3": 2}
+        assert stats == {"l1": 4, "l1_singletons": 0, "l2": 2, "l3": 2}
         axioms = db.causal_query(layer=dream.L3_AXIOM, limit=10)
         assert {a["tags"] for a in axioms} == {"perf", "build"}
 
@@ -714,8 +858,9 @@ class TestPass5Forget:
 
 class TestConsolidate:
     def test_runs_every_pass_end_to_end(self, temp_db):
+        """The session states ONE claim twice, so the episode may carry it."""
         _add_l0("m1", "build failed because the lockfile was stale", session="s")
-        _add_l0("m2", "tests failed because the lockfile was stale", session="s")
+        _add_l0("m2", "build failed because the lockfile was stale", session="s")
 
         stats = dream.consolidate()
 
@@ -726,6 +871,17 @@ class TestConsolidate:
         assert stats["dry_run"] is False
         assert stats["duration_sec"] >= 0
         assert db.belief_all_active()
+
+    def test_a_session_that_disagrees_promotes_no_belief(self, temp_db):
+        """Two different claims in one session must not be welded into a third."""
+        _add_l0("m1", "build failed because the lockfile was stale", session="s")
+        _add_l0("m2", "tests failed because the cache was cold", session="s")
+
+        stats = dream.consolidate()
+
+        assert stats["pass2_compress"]["l1"] == 1
+        assert stats["pass3_reconcile"]["asserted"] == 0
+        assert db.belief_all_active() == []
 
     def test_is_safe_to_run_twice(self, temp_db):
         _add_l0("m1", "a because b", session="s")

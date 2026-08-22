@@ -257,6 +257,120 @@ class TestEphemeralSuppression:
         assert any(h["type"] == patterns.EPHEMERAL for h in hits)
         assert any(h["type"] == patterns.NEGATIVE_CONSTRAINT for h in hits)
 
+    @pytest.mark.parametrize(
+        "text,label",
+        [
+            ("пропусти сейчас. и никогда не коммить в main", "ru.never"),
+            ("skip the lint for now, but never commit to main", "en.never"),
+            ("temporarily disable it.\nalways use uv run", "en.always"),
+            ("just this once, ok? don't touch the schema", "en.dont_touch"),
+            ("не трогай конфиг, но тесты пропусти сейчас", "ru.dont_touch"),
+        ],
+    )
+    def test_durable_rule_in_another_clause_survives(self, text, label):
+        hit = patterns.detect_friction(text)
+        assert hit is not None and hit["label"] == label, text
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "не трогай это, только для теста",
+            "don't touch it, just this once",
+            "skip the tests for now",
+        ],
+    )
+    def test_marker_still_suppresses_its_own_clause(self, text):
+        assert patterns.detect_friction(text) is None, text
+
+    def test_suppressed_spans_empty_without_marker(self):
+        assert patterns.suppressed_spans(patterns.normalize("не трогай конфиг")) == []
+
+
+class TestCalibratedFalsePositives:
+    """Non-friction phrasings the 2026-08-22 audit measured as live FPs."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "docker stop the container",
+            "stop words list for the tokenizer",
+            "something went wrong in the build",
+            "ValueError: wrong type",
+            "git revert the last commit",
+            "403 Forbidden",
+            "not allowed by CORS policy",
+            "you need Node >= 20 installed",
+            "i only use uv here",
+        ],
+    )
+    def test_english_non_friction(self, text):
+        assert patterns.detect_friction(text) is None, text
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "надо скопировать файл",
+            "нужно сделать миграцию",
+            "надо понять почему падает",
+            "нужно для отчёта",
+            "должен вернуть json",
+            "только в проде",
+            "только из кэша",
+            "строго по расписанию",
+            "нет времени на это",
+            "убрал мусор из билда",
+        ],
+    )
+    def test_russian_non_friction(self, text):
+        assert patterns.detect_friction(text) is None, text
+
+
+class TestCalibratedRecall:
+    @pytest.mark.parametrize(
+        "text,ptype",
+        [
+            ("я же просил не трогать этот файл", patterns.NEGATIVE_CONSTRAINT),
+            ("я просил не использовать redis", patterns.NEGATIVE_CONSTRAINT),
+            ("не менять схему", patterns.NEGATIVE_CONSTRAINT),
+            ("i told you not to touch that", patterns.NEGATIVE_CONSTRAINT),
+            ("всегда надо прогонять тесты", patterns.POSITIVE_REQUIREMENT),
+            ("нужно обязательно чистить кэш", patterns.POSITIVE_REQUIREMENT),
+            ("we have been over this", patterns.FRUSTRATION),
+            ("did you even read the file", patterns.FRUSTRATION),
+            ("мы это уже обсуждали", patterns.FRUSTRATION),
+            ("ты вообще читал документацию", patterns.FRUSTRATION),
+            ("опять сломал сборку", patterns.FRUSTRATION),
+            ("that's the wrong file", patterns.HARD_REJECTION),
+        ],
+    )
+    def test_still_detected(self, text, ptype):
+        hit = patterns.detect_friction(text)
+        assert hit is not None and hit["type"] == ptype, text
+
+
+class TestNormalizeFolding:
+    @pytest.mark.parametrize("apostrophe", ["\u2019", "\u2018", "\u02bc", "\u00b4", "`"])
+    def test_smart_apostrophes_are_folded(self, apostrophe):
+        text = f"don{apostrophe}t touch the config"
+        assert patterns.normalize(text).count("'") == 1
+        hit = patterns.detect_friction(text)
+        assert hit is not None and hit["label"] == "en.dont_touch"
+
+    @pytest.mark.parametrize(
+        "text",
+        ["нe трогай конфиг", "никогда нe используй redis", "нeправильно"],
+    )
+    def test_latin_homoglyphs_adjacent_to_cyrillic_are_folded(self, text):
+        assert patterns.detect_friction(text) is not None, text
+
+    def test_pure_ascii_is_left_alone(self):
+        assert patterns.normalize("dont touch the docker cache") == (
+            "dont touch the docker cache"
+        )
+
+    def test_ascii_words_inside_russian_survive(self):
+        assert "docker" in patterns.normalize("не трогай docker")
+
 
 class TestDetectFrictionContract:
     def test_returns_none_for_empty(self):
@@ -418,20 +532,35 @@ class TestPostToolObservations:
         }
         assert observer.post_tool_observations(payload)[0].effect == "tool_error"
 
-    def test_friction_in_output_is_captured(self):
+    @pytest.mark.parametrize(
+        "output",
+        [
+            "не трогай этот файл",
+            "don't touch the config",
+            "always use uv run",
+            "Stop\nNo\nwrong",
+            "я же просил",
+        ],
+    )
+    def test_friction_in_tool_output_is_never_captured(self, output):
+        payload = {"tool_name": "Bash", "session_id": "s9", "tool_response": {"output": output}}
+        obs = observer.post_tool_observations(payload)
+        assert all(o.effect not in patterns.PATTERN_TYPES for o in obs), output
+
+    def test_friction_carrying_output_still_reports_a_real_error(self):
         payload = {
             "tool_name": "Bash",
-            "session_id": "s9",
-            "tool_response": {"output": "не трогай этот файл"},
+            "tool_response": {"is_error": True, "stderr": "не трогай этот файл"},
         }
         obs = observer.post_tool_observations(payload)
-        assert any(o.effect == patterns.NEGATIVE_CONSTRAINT for o in obs)
+        assert [o.effect for o in obs] == ["tool_error"]
 
-    def test_confidence_is_damped_to_l0_range(self):
-        payload = {"tool_name": "Bash", "tool_response": {"output": "не трогай этот файл"}}
-        friction = [o for o in observer.post_tool_observations(payload)
-                    if o.effect == patterns.NEGATIVE_CONSTRAINT][0]
-        assert 0.2 <= friction.confidence <= 0.5
+    def test_todowrite_output_produces_nothing(self):
+        payload = {
+            "tool_name": "TodoWrite",
+            "tool_response": {"output": "Stop the ralph loop\nNo pending items"},
+        }
+        assert observer.post_tool_observations(payload) == []
 
     def test_camelcase_keys_supported(self):
         payload = {"toolName": "Bash", "sessionId": "s2", "toolResponse": {"error": "x"}}
@@ -481,6 +610,14 @@ class TestSessionEndObservations:
         effects = {o.effect for o in obs}
         assert patterns.NEGATIVE_CONSTRAINT in effects
         assert patterns.FRUSTRATION in effects
+
+    def test_confidence_is_damped_to_l0_range(self, tmp_path):
+        path = _write_transcript(tmp_path, [
+            {"role": "user", "content": "не трогай этот файл"},
+        ])
+        obs = observer.session_end_observations({}, path)
+        friction = [o for o in obs if o.effect == patterns.NEGATIVE_CONSTRAINT][0]
+        assert 0.2 <= friction.confidence <= 0.5
 
     def test_assistant_messages_are_ignored(self, tmp_path):
         path = _write_transcript(tmp_path, [

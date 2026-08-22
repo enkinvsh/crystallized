@@ -84,6 +84,14 @@ CONTRADICTION_MARGIN = 0.2
 #: producer cannot turn a nightly job into an all-night job.
 DEFAULT_INGEST_LIMIT = 5000
 
+#: A session that never gained a second member is not a pattern — but it must
+#: not sit at the head of the ingest window forever either. Orphans are the
+#: OLDEST rows, so ``ORDER BY observed_at ASC LIMIT n`` hands them the whole
+#: budget every single night and fresh records are never reached. Once a lone
+#: record is this old no sibling is still coming, so it is promoted as a
+#: singleton episode: the budget frees and Pass 5 can eventually reclaim it.
+SINGLETON_EPISODE_AFTER_DAYS = 2.0
+
 #: "X because Y" / "X -> Y" style cues used to recover a cause/effect pair from
 #: free text when the hook did not supply one.
 _CAUSE_EFFECT_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -293,31 +301,58 @@ def _group_by_dominant_tag(rows: list[dict]) -> dict[str, list[dict]]:
     return groups
 
 
+def _coherent_pair(members: list[dict]) -> tuple[str | None, str | None]:
+    """Inherit a cause/effect pair ONLY when every member states the same one.
+
+    Taking ``members[0].cause`` with ``members[-1].effect`` welds the cause of
+    one trace onto the effect of another — at L2/L3 those traces come from
+    different sessions and different topics entirely. Pass 3 then promotes that
+    invention to an ACTIVE belief, so the memory ends up asserting a causal
+    claim nobody ever observed. Diverse members therefore carry NO pair: a
+    missing belief is recoverable, a fabricated one is not.
+    """
+    pairs = {
+        (" ".join((m.get("cause") or "").split()), " ".join((m.get("effect") or "").split()))
+        for m in members
+        if (m.get("cause") or "").strip() and (m.get("effect") or "").strip()
+    }
+    return pairs.pop() if len(pairs) == 1 else (None, None)
+
+
+def _shared_session(members: list[dict]) -> str | None:
+    """The members' session id when they agree, else None — never an arbitrary one."""
+    sessions = {m.get("session_id") for m in members}
+    return sessions.pop() if len(sessions) == 1 else None
+
+
 def _promote(
     members: list[dict],
     layer: int,
     headline: str,
     tags: str | None = None,
     dry_run: bool = False,
+    min_members: int | None = None,
 ) -> str | None:
     """Create one parent row at ``layer`` and reparent its members onto it."""
-    if len(members) < MIN_MEMBERS[layer]:
+    required = MIN_MEMBERS[layer] if min_members is None else max(1, min_members)
+    if len(members) < required:
         return None
     member_ids = [m["id"] for m in members]
     parent_id = _synthetic_id(layer, member_ids)
     if dry_run:
         return parent_id
 
+    cause, effect = _coherent_pair(members)
     with db.write_txn() as txn:
         db.causal_insert(
             id=parent_id,
             text=_summarize(members, headline),
             layer=layer,
-            cause=members[0].get("cause"),
-            effect=members[-1].get("effect"),
+            cause=cause,
+            effect=effect,
             confidence=min(1.0, _mean_confidence(members) * ABSTRACTION_DISCOUNT),
             source_ref=f"dream:pass2:l{layer}",
-            session_id=members[0].get("session_id"),
+            session_id=_shared_session(members),
             observed_at=min(m.get("observed_at") or "" for m in members) or None,
             tags=tags if tags is not None else _merge_tags(members),
             conn=txn,
@@ -340,19 +375,62 @@ def _orphans_at(layer: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def pass2_compress(l0_rows: list[dict], dry_run: bool = False) -> dict:
+def _parse_observed(ts: str | None) -> datetime | None:
+    if not ts:
+        return None
+    try:
+        parsed = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _is_settled(members: list[dict], now: datetime, after_days: float) -> bool:
+    """True once the group's NEWEST member is old enough that no sibling is coming.
+
+    An unreadable clock counts as settled: a row that cannot be dated must not
+    be allowed to hold the ingest budget hostage forever.
+    """
+    newest = max((_parse_observed(m.get("observed_at")) for m in members), default=None,
+                 key=lambda dt: dt or datetime.min.replace(tzinfo=UTC))
+    if newest is None:
+        return True
+    return (now - newest).total_seconds() >= after_days * 86400.0
+
+
+def pass2_compress(
+    l0_rows: list[dict],
+    dry_run: bool = False,
+    now: datetime | None = None,
+    singleton_after_days: float = SINGLETON_EPISODE_AFTER_DAYS,
+) -> dict:
     """Build the abstraction ladder: episodes, then digests, then axioms.
 
     Each rung only consumes rows that no higher rung has claimed, so the ladder
     is stable across runs: yesterday's episodes are not re-episoded tonight.
+
+    A session below ``MIN_MEMBERS`` normally waits for a sibling that may still
+    arrive. Once it is older than ``singleton_after_days`` that wait is over and
+    it is promoted alone — see ``SINGLETON_EPISODE_AFTER_DAYS``.
     """
-    stats = {"l1": 0, "l2": 0, "l3": 0}
+    now = now or datetime.now(UTC)
+    stats = {"l1": 0, "l1_singletons": 0, "l2": 0, "l3": 0}
 
     # L0 -> L1: one episode per session.
     for session, members in sorted(_group_l0_by_session(l0_rows).items()):
         label = session if session.startswith("day:") else f"session {session}"
-        if _promote(members, L1_EPISODE, f"Episode ({label}):", dry_run=dry_run):
+        singleton = len(members) < MIN_MEMBERS[L1_EPISODE] and _is_settled(
+            members, now, singleton_after_days
+        )
+        if _promote(
+            members,
+            L1_EPISODE,
+            f"Episode ({label}):",
+            dry_run=dry_run,
+            min_members=1 if singleton else None,
+        ):
             stats["l1"] += 1
+            stats["l1_singletons"] += int(singleton)
 
     # L1 -> L2: one thematic digest per dominant tag.
     for tag, members in sorted(_group_by_dominant_tag(_orphans_at(L1_EPISODE)).items()):
@@ -553,7 +631,8 @@ def format_report(stats: dict) -> str:
     return (
         f"{prefix}Dream cycle complete in {stats['duration_sec']}s\n"
         f"  Pass 1 ingest:    {p1['scanned']} scanned, {p1['enriched']} enriched\n"
-        f"  Pass 2 compress:  {p2['l1']} episodes, {p2['l2']} digests, {p2['l3']} axioms\n"
+        f"  Pass 2 compress:  {p2['l1']} episodes ({p2.get('l1_singletons', 0)} singleton), "
+        f"{p2['l2']} digests, {p2['l3']} axioms\n"
         f"  Pass 3 reconcile: {p3['asserted']} asserted, {p3['superseded']} superseded, "
         f"{p3['rejected']} rejected, {p3['unchanged']} unchanged, {p3['shadowed']} shadowed\n"
         f"  Pass 4 decay:     {p4['total_decayed']} volumes "

@@ -115,3 +115,90 @@ def test_belief_state_supersession():
     all_active = db.belief_all_active("user.preferences")
     assert len(all_active) == 1
     assert all_active[0]["id"] == "b2"
+
+
+def _belief_count() -> int:
+    return int(db.get_db().execute("SELECT COUNT(*) FROM belief_state").fetchone()[0])
+
+
+def _belief_row(id: str) -> dict:
+    return dict(db.get_db().execute(
+        "SELECT * FROM belief_state WHERE id = ?", (id,)
+    ).fetchone())
+
+
+def test_belief_assert_is_repeatable_with_the_same_id():
+    """Re-asserting the incumbent's own id updates it in place, never collides.
+
+    The old code superseded the incumbent by ITSELF (superseded_by = its own id)
+    and then re-inserted that same primary key, so the second call to a public
+    MCP tool whose id is documented as reusable raised IntegrityError.
+    """
+    for value in ("jest", "vitest", "vitest", "bun"):
+        db.belief_assert(
+            id="b1",
+            subject="user.preferences",
+            predicate="test_runner",
+            object_val=value,
+            confidence=0.8,
+        )
+
+    active = db.belief_get_active("user.preferences", "test_runner")
+    assert active is not None
+    assert active["id"] == "b1"
+    assert active["object"] == "bun"
+    assert active["status"] == "active"
+    assert active["superseded_by"] is None
+    assert active["valid_to"] is None
+    assert _belief_count() == 1
+
+
+def test_belief_assert_returns_the_key_it_landed_on():
+    assert db.belief_assert(id="b1", subject="s", predicate="p", object_val="x") == "b1"
+    assert db.belief_assert(id="b1", subject="s", predicate="p", object_val="y") == "b1"
+
+
+def test_belief_assert_reuses_an_id_taken_by_a_superseded_version():
+    """An id parked in history must not be overwritten NOR collide."""
+    db.belief_assert(id="b1", subject="s", predicate="p", object_val="jest")
+    db.belief_assert(id="b2", subject="s", predicate="p", object_val="vitest")
+
+    landed = db.belief_assert(id="b1", subject="s", predicate="p", object_val="mocha")
+
+    assert landed != "b1"
+    active = db.belief_get_active("s", "p")
+    assert active["id"] == landed
+    assert active["object"] == "mocha"
+    assert active["supersedes"] == "b2"
+    # Both older versions survive, dated and back-linked.
+    assert _belief_row("b1")["status"] == "superseded"
+    assert _belief_row("b1")["superseded_by"] == "b2"
+    assert _belief_row("b2")["status"] == "superseded"
+    assert _belief_row("b2")["superseded_by"] == landed
+    assert _belief_count() == 3
+
+
+def test_belief_assert_reuses_an_id_across_subjects():
+    """The same id on a different subject must not clobber the first belief."""
+    db.belief_assert(id="shared", subject="a", predicate="p", object_val="x")
+    landed = db.belief_assert(id="shared", subject="b", predicate="p", object_val="y")
+
+    assert landed != "shared"
+    assert db.belief_get_active("a", "p")["id"] == "shared"
+    assert db.belief_get_active("b", "p")["id"] == landed
+    assert _belief_count() == 2
+
+
+def test_belief_assert_survives_a_long_flip_flop_on_one_id():
+    """Hammering one id across contradicting values must never raise."""
+    for i in range(20):
+        db.belief_assert(
+            id="b1",
+            subject="s",
+            predicate="p",
+            object_val="A" if i % 2 == 0 else "B",
+        )
+    active = db.belief_get_active("s", "p")
+    assert active["id"] == "b1"
+    assert active["object"] == "B"
+    assert _belief_count() == 1
