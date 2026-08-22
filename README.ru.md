@@ -50,15 +50,23 @@
 
 ---
 
-## <img src="docs/icons/flash.svg" width="22" alt="" /> Запуск за 1 минуту
+## <img src="docs/icons/flash.svg" width="22" alt="" /> Установка в 1 клик через агента
+
+Если ты работаешь в **OpenCode**, **Claude Code**, **Cursor** или **Windsurf**, просто скопируй этот промпт и отправь своему агенту:
+
+```markdown
+Установи и настрой память Crystallized из репозитория https://github.com/enkinvsh/crystallized.
+Склонируй репозиторий, выполни ./install.sh, извлеки токен авторизации Claude Desktop
+через python3 auth/extract_token.py и убедись, что MCP-сервер памяти подключен в opencode.json.
+```
+
+### Ручная установка через терминал:
 
 ```bash
 git clone https://github.com/enkinvsh/crystallized.git
 cd crystallized
 ./install.sh
 ```
-
-Скрипт сам настроит окружение, создаст базу памяти и подключит хуки к твоим программам.
 
 ---
 
