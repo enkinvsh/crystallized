@@ -3,8 +3,10 @@
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -147,7 +149,7 @@ class TestTokenBudget:
     @staticmethod
     def _wide_sections() -> list[str]:
         return [
-            "[Clock] 2026-08-22 04:00 Sat (UTC)",
+            "[Clock] 2026-08-22 09:00 Sat +05:00 (UTC 04:00)",
             "[Memory] Relevant facts (60):\n"
             + "\n".join(f"  key{i}: value{i}" for i in range(60)),
             "[Memory] recall(query) for deep search.",
@@ -156,3 +158,63 @@ class TestTokenBudget:
     def test_fit_to_budget_is_a_noop_when_already_small(self):
         sections = ["[Clock] now", "[Memory] tiny"]
         assert inject.fit_to_budget(sections) == sections
+
+    def test_a_long_single_line_section_does_not_stop_the_pass(self):
+        """The widest section can be an untrimmable one-liner.
+
+        Treating that as the end of the pass stranded detail lines in every
+        other section — the failure the widened clock header exposed.
+        """
+        sections = [
+            "[Clock] " + "x" * 200,
+            "[Memory] facts:\n" + "\n".join(f"  key{i}: value{i}" for i in range(40)),
+        ]
+        fitted = inject.fit_to_budget(sections, max_tokens=1)
+        assert fitted[:-1] == [s.split("\n")[0] for s in sections]
+        assert fitted[-1] == inject.TRIM_MARKER
+
+    def test_trimming_is_deterministic_across_repeated_runs(self):
+        runs = {
+            tuple(inject.fit_to_budget(self._wide_sections(), max_tokens=200))
+            for _ in range(20)
+        }
+        assert len(runs) == 1
+
+
+class TestClockLine:
+    """The header must say which clock it is, in both of the store's conventions.
+
+    ``facts``/``docs``/``events`` carry naive local stamps; ``causal_memories``
+    and ``belief_state`` carry UTC-aware ones. The header used to print UTC only,
+    so a 09:10 fact and the 04:10 causal row written in the same second looked
+    five hours apart.
+    """
+
+    _INSTANT = datetime(2026, 8, 22, 4, 10, tzinfo=UTC)
+
+    def test_shows_local_wall_clock_and_utc_for_the_same_instant(self):
+        line = inject.clock_line(self._INSTANT)
+        assert line.startswith("[Clock] ")
+        assert f"{self._INSTANT.astimezone():%Y-%m-%d %H:%M %a}" in line
+        assert f"(UTC {self._INSTANT:%H:%M})" in line
+
+    def test_offset_is_written_as_signed_hh_mm(self):
+        assert re.search(r" [+-]\d{2}:\d{2} \(UTC \d{2}:\d{2}\)$", inject.clock_line(self._INSTANT))
+
+    def test_a_naive_stamp_is_read_as_local_and_never_shifted(self):
+        naive = self._INSTANT.astimezone().replace(tzinfo=None)
+        assert inject.clock_line(naive) == inject.clock_line(self._INSTANT)
+
+    def test_every_representation_of_one_instant_yields_one_line(self):
+        elsewhere = self._INSTANT.astimezone(timezone(timedelta(hours=9)))
+        assert inject.clock_line(elsewhere) == inject.clock_line(self._INSTANT)
+
+    def test_defaults_to_the_current_moment(self):
+        assert inject.clock_line().startswith("[Clock] ")
+
+    def test_the_header_the_hook_emits_carries_both_clocks(self, tmp_path):
+        env = _populated_env(tmp_path)
+        result = _run_hook(env, "какая сейчас память")
+        assert result.returncode == 0
+        header = result.stdout.splitlines()[0]
+        assert re.match(r"^\[Clock\] \d{4}-\d{2}-\d{2} \d{2}:\d{2} \w{3} [+-]\d{2}:\d{2} \(UTC \d{2}:\d{2}\)$", header)

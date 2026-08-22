@@ -17,7 +17,7 @@ import os as _os
 import socket
 import sqlite3
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 _VENV_SITE_PATTERN = _os.path.join(
@@ -168,17 +168,25 @@ def fit_to_budget(sections: list[str], max_tokens: int = MAX_INJECT_TOKENS) -> l
     to hold them yields a header-only payload rather than an empty one. The
     trim marker's own cost is reserved before trimming, otherwise appending it
     would push the result back over budget.
+
+    A section that is already a lone header is set aside, not treated as the end
+    of the pass. Ending there would let one long single-line section — the clock
+    header is the longest — strand detail lines in every other section once it
+    became the widest, which is how the floor invariant used to be violated.
     """
     sections = list(sections)
     if estimate_tokens("\n".join(sections)) <= max_tokens:
         return sections
 
     budget = max_tokens - estimate_tokens("\n" + TRIM_MARKER)
-    while estimate_tokens("\n".join(sections)) > budget:
-        widest = max(range(len(sections)), key=lambda i: len(sections[i]))
+    trimmable = set(range(len(sections)))
+    while trimmable and estimate_tokens("\n".join(sections)) > budget:
+        # Longest first; lowest index breaks ties so the pass stays deterministic.
+        widest = max(trimmable, key=lambda i: (len(sections[i]), -i))
         lines = sections[widest].split("\n")
         if len(lines) < 2:
-            break
+            trimmable.discard(widest)
+            continue
         sections[widest] = "\n".join(lines[:-1])
     sections.append(TRIM_MARKER)
     return sections
@@ -302,6 +310,24 @@ def get_relevant_facts_keyword(
     return output, len(facts)
 
 
+def clock_line(now: datetime | None = None) -> str:
+    """Wall-clock header: local time first, UTC alongside it.
+
+    The store keeps two timestamp conventions. ``facts``, ``docs`` and
+    ``events`` are written with a naive ``datetime.now()`` — local time.
+    ``causal_memories`` and ``belief_state`` are written UTC-aware. Printing
+    only UTC here made every freshly written fact look five hours into the
+    future and invited comparing the two layers against each other. Both
+    readings are shown so neither has to be inferred.
+    """
+    local = (now or datetime.now()).astimezone()
+    offset = local.strftime("%z")
+    return (
+        f"[Clock] {local:%Y-%m-%d %H:%M %a} "
+        f"{offset[:3]}:{offset[3:]} (UTC {local.astimezone(UTC):%H:%M})"
+    )
+
+
 def main():
     user_message = ""
     try:
@@ -316,10 +342,7 @@ def main():
 
     sections = []
 
-    tz_offset = timezone(timedelta(hours=0))
-    now = datetime.now(tz_offset)
-    time_str = now.strftime("%Y-%m-%d %H:%M %a")
-    sections.append(f"[Clock] {time_str} (UTC)")
+    sections.append(clock_line())
 
     semantic_results = query_semantic(user_message) if user_message else None
 
