@@ -89,11 +89,9 @@ cd crystallized
 
 ## <img src="docs/icons/heart.svg" width="22" alt="" /> Поддержать проект
 
-Прямые on-chain переводы (без посредников и комиссий):
-
-- **TON / USDT (TON Network)**: `UQAhzOYPIBQthqrwCFcIpsWUZjmi4KrK3BuGnjAQmJW04IC8`
+- **TON / USDT (TON)**: `UQAhzOYPIBQthqrwCFcIpsWUZjmi4KrK3BuGnjAQmJW04IC8`
 - **USDT (TRC-20)**: `TGHVN7y5EhZ4pAreAXbffKY86kpq1dve9h`
-- **Банковские карты**: [Tribute](https://web.tribute.tg/d/Huc)
+- **Карты**: [Tribute](https://web.tribute.tg/d/Huc)
 
 ---
 
