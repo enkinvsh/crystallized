@@ -70,6 +70,14 @@ cd crystallized
 
 ---
 
+## <img src="docs/icons/heart.svg" width="22" alt="" /> Поддержать проект
+
+Если Crystallized экономит твои нервы и время:
+
+- [Tribute (карты и крипта)](https://web.tribute.tg/d/Huc)
+
+---
+
 ## <img src="docs/icons/license.svg" width="22" alt="" /> Лицензия
 
 MIT License.
