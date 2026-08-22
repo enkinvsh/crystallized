@@ -1,0 +1,21 @@
+{
+  "mcp": {
+    "flutter-dev": {
+      "type": "local",
+      "enabled": true,
+      "command": [
+        "UV_PATH",
+        "run",
+        "--project",
+        "FLUTTER_MCP_SERVER_PATH",
+        "python",
+        "FLUTTER_MCP_SERVER_PATH/server.py"
+      ],
+      "environment": {
+        "FLUTTER_MCP_PROJECT": "YOUR_FLUTTER_PROJECT_PATH",
+        "FLUTTER_MCP_PACKAGE": "com.example.yourapp",
+        "FLUTTER_MCP_APK_RELATIVE": "build/app/outputs/flutter-apk/app-release.apk"
+      }
+    }
+  }
+}

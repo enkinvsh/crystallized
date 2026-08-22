@@ -1,0 +1,14 @@
+{
+  "mcp": {
+    "fcp": {
+      "type": "local",
+      "enabled": true,
+      "command": [
+        "FCP_MCP_PATH"
+      ],
+      "environment": {
+        "FCP_PROJECTS_DIR": "YOUR_HOME/Movies"
+      }
+    }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "mcp": {
+    "codebase-memory-mcp": {
+      "type": "local",
+      "enabled": true,
+      "command": [
+        "CODEBASE_MEMORY_PATH"
+      ],
+      "environment": {
+        "CBM_ALLOWED_ROOT": "YOUR_PROJECTS_ROOT",
+        "CBM_CACHE_DIR": "YOUR_HOME/.cache/codebase-memory-mcp",
+        "CBM_LOG_LEVEL": "warn"
+      }
+    }
+  }
+}

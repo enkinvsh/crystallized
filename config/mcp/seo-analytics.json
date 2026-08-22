@@ -1,0 +1,41 @@
+{
+  "mcp": {
+    "google-search-console": {
+      "type": "local",
+      "enabled": true,
+      "command": [
+        "npx",
+        "-y",
+        "mcp-server-gsc"
+      ],
+      "environment": {
+        "GOOGLE_APPLICATION_CREDENTIALS": "YOUR_HOME/.config/opencode/secrets/gsc-service-account.json"
+      }
+    },
+    "yandex-webmaster": {
+      "type": "local",
+      "enabled": true,
+      "command": [
+        "npx",
+        "-y",
+        "yandex-webmaster-mcp-server"
+      ],
+      "environment": {
+        "YANDEX_WEBMASTER_OAUTH_TOKEN": "{file:~/.config/opencode/secrets/yandex-oauth-token}",
+        "YANDEX_WEBMASTER_HOST_URL": "https://your-site.example"
+      }
+    },
+    "yandex-metrika": {
+      "type": "local",
+      "enabled": true,
+      "command": [
+        "npx",
+        "-y",
+        "@theyahia/yandex-metrika-mcp"
+      ],
+      "environment": {
+        "YANDEX_METRIKA_TOKEN": "{file:~/.config/opencode/secrets/yandex-oauth-token}"
+      }
+    }
+  }
+}

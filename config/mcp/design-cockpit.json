@@ -1,0 +1,19 @@
+{
+  "mcp": {
+    "design-cockpit": {
+      "type": "local",
+      "enabled": true,
+      "command": [
+        "UV_PATH",
+        "run",
+        "--project",
+        "DESIGN_COCKPIT_PATH",
+        "python",
+        "DESIGN_COCKPIT_PATH/server.py"
+      ],
+      "environment": {
+        "DESIGN_COCKPIT_SESSION_DIR": "YOUR_HOME/.cache/design-cockpit/sessions"
+      }
+    }
+  }
+}
