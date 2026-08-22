@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Nightly memory consolidation (dream.py) for crystallized.
+  Memory consolidation (dream.py) for crystallized.
 
   Template: MEMORY_PATH is replaced with the install destination
   (default: ~/.config/opencode/memory) by install.sh.
@@ -16,11 +16,20 @@
       launchctl bootout gui/$(id -u)/com.crystallized.dream
 
   Notes:
-    * RunAtLoad is false — consolidation is a *nightly* batch job, not a
-      login-time one. Loading the agent must never kick off a full pass while
-      the user is starting a session.
-    * A missed 04:00 (laptop asleep) is run by launchd once the machine wakes.
-      dream.py is idempotent, so a late or repeated run is harmless.
+    * This polls; it does not keep an appointment. A StartCalendarInterval hour
+      is DROPPED outright when the machine is powered off at that moment — it is
+      only coalesced across sleep — and this laptop is regularly off at 04:00,
+      which is why the nightly job recorded runs = 0. dream.py decides for
+      itself whether any given poll should do work.
+    * StartInterval fires roughly every 15 minutes while awake, and again
+      shortly after each wake, so a machine that was off catches up on its own.
+      Intervals missed during sleep are dropped rather than replayed as a burst,
+      which is the behaviour we want.
+    * A poll that decides to do nothing costs an interpreter start and two
+      queries. dream.py caps successful passes at one per calendar day and waits
+      for a quiet store, so polling frequency cannot inflate the ladder.
+    * RunAtLoad is false — loading the agent must never kick off a full pass
+      while the user is starting a session.
     * dream.py takes an exclusive flock on <db>-dream.lock and exits 0 when a
       run is already in progress, so overlapping with a manual trigger is safe.
 -->
@@ -39,13 +48,8 @@
     <key>WorkingDirectory</key>
     <string>MEMORY_PATH</string>
 
-    <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key>
-        <integer>4</integer>
-        <key>Minute</key>
-        <integer>0</integer>
-    </dict>
+    <key>StartInterval</key>
+    <integer>900</integer>
 
     <key>RunAtLoad</key>
     <false/>

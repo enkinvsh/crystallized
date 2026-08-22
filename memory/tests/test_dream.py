@@ -43,7 +43,16 @@ def _iso(days_ago: float = 0.0) -> str:
     return (datetime.now(UTC) - timedelta(days=days_ago)).isoformat()
 
 
-def _add_l0(mid: str, text: str, *, session: str | None = "s1", days_ago: float = 0.0,
+#: Default age of a seeded L0 row. Pass 2 refuses to fold a session until it has
+#: been silent for ``SESSION_QUIET_HOURS``, so a row seeded "just now" belongs to
+#: a session that is still live and is deliberately left alone. Tests about
+#: grouping mean "a session that has ended", which is what this expresses; tests
+#: about the wait itself pass ``days_ago`` explicitly.
+SETTLED_DAYS_AGO = 0.5
+
+
+def _add_l0(mid: str, text: str, *, session: str | None = "s1",
+            days_ago: float = SETTLED_DAYS_AGO,
             cause: str | None = None, effect: str | None = None,
             confidence: float = 0.5, tags: str = ""):
     db.causal_insert(
@@ -551,8 +560,8 @@ class TestPass2Compress:
         """
         for i in range(4):
             _add_l0(f"orphan{i}", f"lonely {i}", session=f"solo-{i}", days_ago=30 - i)
-        _add_l0("fresh1", "x", session="pair", days_ago=0)
-        _add_l0("fresh2", "y", session="pair", days_ago=0)
+        _add_l0("fresh1", "x", session="pair")
+        _add_l0("fresh2", "y", session="pair")
 
         first = dream.consolidate(ingest_limit=4)
         assert first["pass1_ingest"]["scanned"] == 4
@@ -593,8 +602,8 @@ class TestPass2Compress:
         assert _row(_row("m1")["parent_id"])["session_id"] == "sess-a"
 
     def test_sessionless_rows_group_by_day(self, temp_db):
-        _add_l0("m1", "x", session=None, days_ago=0)
-        _add_l0("m2", "y", session=None, days_ago=0)
+        _add_l0("m1", "x", session=None)
+        _add_l0("m2", "y", session=None)
         assert dream.pass2_compress(dream.pass1_ingest()["rows"])["l1"] == 1
 
     def test_summary_is_lossy_but_carries_its_members(self, temp_db):
@@ -639,7 +648,7 @@ class TestPass2Compress:
         and one digest is not yet a pattern — so no axiom is minted."""
         self._seed_night(1)
         stats = dream.pass2_compress(dream.pass1_ingest()["rows"])
-        assert stats == {"l1": 4, "l1_singletons": 0, "l2": 2, "l3": 0}
+        assert stats == {"l1": 4, "l1_singletons": 0, "l1_deferred": 0, "l2": 2, "l3": 0}
 
     def test_a_theme_that_recurs_across_nights_becomes_an_axiom(self, temp_db):
         """Axioms are earned by recurrence: a second night's digest on the same
@@ -650,7 +659,7 @@ class TestPass2Compress:
         self._seed_night(2)
         stats = dream.pass2_compress(dream.pass1_ingest()["rows"])
 
-        assert stats == {"l1": 4, "l1_singletons": 0, "l2": 2, "l3": 2}
+        assert stats == {"l1": 4, "l1_singletons": 0, "l1_deferred": 0, "l2": 2, "l3": 2}
         axioms = db.causal_query(layer=dream.L3_AXIOM, limit=10)
         assert {a["tags"] for a in axioms} == {"perf", "build"}
 
@@ -682,6 +691,100 @@ def _add_ln(mid, layer, cause, effect, *, days_ago=0.0, confidence=0.8):
         confidence=confidence,
         observed_at=_iso(days_ago),
     )
+
+
+class TestLadderIsFrequencyInvariant:
+    """The ladder must be a function of the evidence, never of the cadence.
+
+    Replaying one real day of this store at 1, 9 and 27 passes produced 12/26/42
+    episodes and 0/4/8 axioms from identical input. A pass landing mid-session
+    froze whatever rows existed at that instant into an episode, and because
+    ``_synthetic_id`` hashes the member set, nothing ever merges a fragment
+    back — so how often the daemon happened to run decided what became a
+    standing principle.
+    """
+
+    @staticmethod
+    def _seed_live_session(n: int = 6) -> None:
+        """A session whose rows are still arriving — nothing has fallen silent."""
+        for i in range(n):
+            _add_l0(f"m{i}", f"step {i}", session="sess", days_ago=0.0)
+
+    @staticmethod
+    def _build(passes: int, now: datetime | None = None) -> dict[str, int]:
+        """Total rungs CREATED across the whole run of passes, not the end state."""
+        built = {"l1": 0, "l2": 0, "l3": 0}
+        for _ in range(passes):
+            rows = dream.pass1_ingest()["rows"]
+            stats = dream.pass2_compress(rows, now=now)
+            for rung in built:
+                built[rung] += stats[rung]
+        return built
+
+    @pytest.mark.parametrize("passes", [1, 9, 27])
+    def test_polling_a_live_session_folds_nothing(self, temp_db, passes):
+        self._seed_live_session()
+        assert self._build(passes) == {"l1": 0, "l2": 0, "l3": 0}
+        assert all(_row(f"m{i}")["parent_id"] is None for i in range(6))
+
+    @pytest.mark.parametrize("passes", [1, 9, 27])
+    def test_a_finished_session_yields_one_episode_at_any_cadence(self, temp_db, passes):
+        self._seed_live_session()
+        silent = datetime.now(UTC) + timedelta(hours=dream.SESSION_QUIET_HOURS + 1)
+        assert self._build(passes, now=silent) == {"l1": 1, "l2": 0, "l3": 0}
+
+    def test_rows_arriving_between_passes_still_make_one_whole_episode(self, temp_db):
+        """The daemon polls throughout the session; it must not come out in pieces."""
+        for i in range(6):
+            _add_l0(f"m{i}", f"step {i}", session="sess", days_ago=0.0)
+            dream.consolidate()
+
+        silent = datetime.now(UTC) + timedelta(hours=dream.SESSION_QUIET_HOURS + 1)
+        assert dream.pass2_compress(dream.pass1_ingest()["rows"], now=silent)["l1"] == 1
+
+        parents = {_row(f"m{i}")["parent_id"] for i in range(6)}
+        assert None not in parents
+        assert len(parents) == 1
+
+    def test_a_live_session_is_reported_as_deferred_not_silently_skipped(self, temp_db):
+        self._seed_live_session()
+        stats = dream.pass2_compress(dream.pass1_ingest()["rows"])
+        assert stats["l1_deferred"] == 1
+        assert "1 sessions still live" in dream.format_report(dream.consolidate(dry_run=True))
+
+
+class TestCoherentPair:
+    """A pair is inherited only when EVERY member states it.
+
+    Silence is diversity. Dropping the members that state no pair and then
+    agreeing with whoever is left let ``l2:94ef7d7debec6f62`` inherit
+    ``tool_call:Bash -> tool_error`` from one of its twelve members and assert
+    it on behalf of the other eleven — the ladder by which a single row becomes
+    a system-wide axiom.
+    """
+
+    def test_one_paired_member_does_not_speak_for_the_silent_rest(self):
+        members = [{"cause": "", "effect": ""} for _ in range(11)]
+        members.append({"cause": "tool_call:Bash", "effect": "tool_error"})
+        assert dream._coherent_pair(members) == (None, None)
+
+    def test_a_pair_every_member_states_is_inherited(self):
+        members = [{"cause": "stale lock", "effect": "build fails"} for _ in range(3)]
+        assert dream._coherent_pair(members) == ("stale lock", "build fails")
+
+    def test_whitespace_does_not_count_as_disagreement(self):
+        members = [
+            {"cause": "stale  lock", "effect": "build fails"},
+            {"cause": "stale lock", "effect": "build\nfails"},
+        ]
+        assert dream._coherent_pair(members) == ("stale lock", "build fails")
+
+    def test_members_stating_different_pairs_carry_none(self):
+        members = [{"cause": "a", "effect": "b"}, {"cause": "c", "effect": "d"}]
+        assert dream._coherent_pair(members) == (None, None)
+
+    def test_no_members_carry_no_pair(self):
+        assert dream._coherent_pair([]) == (None, None)
 
 
 class TestBeliefProjection:
@@ -906,6 +1009,83 @@ class TestConsolidate:
             assert marker in text
 
 
+class TestShouldRun:
+    """Time decides whether a poll works, and a pass lands once a calendar day.
+
+    The record of "last pass" is a file of its own, NOT the flock sidecar. That
+    one is stamped on acquisition, before the work: a ``--dry-run`` advances it,
+    and so does a pass that dies halfway. A daemon crash-looping every poll would
+    have kept satisfying the staleness fallback forever.
+    """
+
+    @staticmethod
+    def _record_success(hours_ago: float) -> datetime:
+        moment = datetime.now(UTC) - timedelta(hours=hours_ago)
+        dream.write_last_success(moment)
+        return moment
+
+    def test_runs_when_no_pass_was_ever_recorded(self, temp_db):
+        go, why = dream.should_run()
+        assert go
+        assert "no successful pass" in why
+
+    def test_an_unreadable_record_counts_as_never_run(self, temp_db):
+        dream.state_path().write_text("not a timestamp\n")
+        assert dream.should_run()[0]
+
+    def test_holds_off_when_a_pass_already_landed_today(self, temp_db):
+        self._record_success(hours_ago=0.5)
+        _add_l0("m1", "x", days_ago=30)
+        assert dream.should_run() == (False, "already consolidated today")
+
+    def test_a_missed_day_forces_a_pass_even_with_no_quiet(self, temp_db):
+        self._record_success(hours_ago=27)
+        _add_l0("m1", "x", days_ago=0.0)
+        go, why = dream.should_run()
+        assert go
+        assert "since the last pass" in why
+
+    def test_runs_once_the_day_turned_and_the_store_went_quiet(self, temp_db):
+        self._record_success(hours_ago=25)
+        _add_l0("m1", "x", days_ago=1 / 24)
+        assert dream.should_run()[0]
+
+    def test_waits_while_observations_are_still_landing(self, temp_db):
+        self._record_success(hours_ago=25)
+        _add_l0("m1", "x", days_ago=5 / 1440)
+        go, why = dream.should_run()
+        assert not go
+        assert "quiet" in why
+
+    def test_an_empty_store_has_nothing_to_wait_for(self, temp_db):
+        self._record_success(hours_ago=25)
+        assert dream.should_run()[0]
+
+
+class TestLastSuccessIsOnlyClaimedOnSuccess:
+    def test_a_successful_pass_is_recorded(self, temp_db):
+        assert dream.main(["--force", "--db", str(temp_db)]) == 0
+        assert dream.read_last_success() is not None
+
+    def test_a_dry_run_claims_nothing(self, temp_db):
+        assert dream.main(["--dry-run", "--db", str(temp_db)]) == 0
+        assert dream.read_last_success() is None
+
+    def test_a_pass_that_raises_claims_nothing(self, temp_db, monkeypatch):
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("pass 3 fell over")
+
+        monkeypatch.setattr(dream, "pass3_reconcile", _boom)
+        assert dream.main(["--force", "--db", str(temp_db)]) == 1
+        assert dream.read_last_success() is None
+
+    def test_the_gate_stops_a_second_pass_the_same_day(self, temp_db):
+        assert dream.main(["--force", "--db", str(temp_db)]) == 0
+        first = dream.read_last_success()
+        assert dream.main(["--nightly", "--db", str(temp_db)]) == 0
+        assert dream.read_last_success() == first
+
+
 class TestCli:
     def test_json_output_is_parseable(self, temp_db, capsys):
         assert dream.main(["--json", "--db", str(temp_db)]) == 0
@@ -1032,8 +1212,18 @@ class TestLaunchdTemplate:
         assert args[1].endswith("dream.py")
         assert args[2] == "--nightly"
 
-    def test_scheduled_for_four_am(self, plist):
-        assert plist["StartCalendarInterval"] == {"Hour": 4, "Minute": 0}
+    def test_polls_instead_of_keeping_an_appointment(self, plist):
+        """A calendar hour is dropped outright when the machine is powered off.
+
+        That is why the nightly agent recorded runs = 0: this laptop is
+        regularly shut down at 04:00. An interval has no slot to miss.
+        """
+        assert "StartCalendarInterval" not in plist
+        assert plist["StartInterval"] == 900
+
+    def test_stays_out_of_the_way_while_polling(self, plist):
+        assert plist["ProcessType"] == "Background"
+        assert plist["LowPriorityIO"] is True
 
     def test_does_not_run_at_load(self, plist):
         """Loading the agent must never kick off a full pass mid-session."""

@@ -92,6 +92,30 @@ DEFAULT_INGEST_LIMIT = 5000
 #: singleton episode: the budget frees and Pass 5 can eventually reclaim it.
 SINGLETON_EPISODE_AFTER_DAYS = 2.0
 
+#: How long the store must have been quiet before a scheduled poll does work.
+#: Correctness no longer rides on this — ``SESSION_QUIET_HOURS`` decides what may
+#: be folded — but Pass 4 rewrites hundreds of rows and there is no reason to do
+#: that under someone's fingers. Measured here, the longest gap inside a live
+#: session is 26 minutes, so 45 clears every real pause.
+POLL_QUIET_MINUTES = 45.0
+
+#: A whole day without a successful pass forces one regardless of quiet. Just
+#: over 24h, so the once-a-day rule normally decides and this stays a fallback
+#: for the day that was missed entirely — a machine that was off, most often.
+MAX_STALE_HOURS = 26.0
+
+#: A session is only folded into an episode once it has been silent this long.
+#: Without this gate the ladder is a function of how OFTEN this runs rather than
+#: of what happened: a pass landing mid-session freezes whatever rows exist at
+#: that instant, and ``_synthetic_id`` hashes the member set, so the fragment
+#: can never be merged back. Replaying one real day at 1, 9 and 27 passes
+#: produced 12/26/42 episodes and 0/4/8 axioms from identical input — the
+#: cadence, not the evidence, was deciding what became a standing principle.
+#: The longest gap measured inside a live session here is 26 minutes, so six
+#: hours only ever admits a session that is genuinely over, and every cadence
+#: at or above one pass per window yields the same ladder.
+SESSION_QUIET_HOURS = 6.0
+
 #: "X because Y" / "X -> Y" style cues used to recover a cause/effect pair from
 #: free text when the hook did not supply one.
 _CAUSE_EFFECT_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -142,6 +166,87 @@ def single_writer(blocking: bool = False) -> Iterator[Path]:
             fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# When to run
+# ---------------------------------------------------------------------------
+
+
+def state_path() -> Path:
+    """Sidecar recording the last SUCCESSFUL consolidation."""
+    return db.DB_PATH.parent / f"{db.DB_PATH.name}-dream.state"
+
+
+def read_last_success() -> datetime | None:
+    """The last completed pass, or None when there is no readable record.
+
+    Deliberately NOT the lock file. That one is stamped on acquisition, before
+    the work — so a ``--dry-run`` advances it, and so does a pass that dies in
+    the middle. A daemon crash-looping every poll would keep satisfying the
+    staleness fallback and disable the very failsafe meant to catch it. An
+    unreadable record therefore counts as "never ran": erring toward one extra
+    pass is free, erring toward silence is not.
+    """
+    try:
+        return _parse_observed(state_path().read_text().strip())
+    except OSError:
+        return None
+
+
+def write_last_success(moment: datetime) -> None:
+    """Record a completed pass atomically — a torn file must read as 'never'."""
+    path = state_path()
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(f"{moment.isoformat()}\n")
+    os.replace(tmp, path)
+
+
+def newest_l0() -> datetime | None:
+    """When the store last took in a raw observation.
+
+    This is the agent's clock, not the human's: HID idle time would call a long
+    unattended task "quiet". ``events`` would be worse still — naive local time
+    against this UTC one is a five-hour error, and it is a ring buffer besides.
+    """
+    with db.read_conn() as c:
+        row = c.execute(
+            "SELECT MAX(observed_at) AS newest FROM causal_memories WHERE layer = 0"
+        ).fetchone()
+    return _parse_observed(row["newest"] if row else None)
+
+
+def should_run(now: datetime | None = None) -> tuple[bool, str]:
+    """Decide whether this poll consolidates, and say why either way.
+
+    Time is the trigger, not a hook and not a fixed hour. A hook cannot fire for
+    a machine that was asleep; an hour cannot fire for one that was off, because
+    launchd drops a missed calendar slot entirely once the machine is powered
+    down. Asking "how long since the last successful pass" survives both.
+
+    A successful pass is capped at one per calendar day. Pass 2 no longer cares
+    how often it runs, but the rungs above it still have no settling gate of
+    their own — without the cap, cadence would go back to deciding how many
+    digests and axioms a day produces.
+    """
+    now = now or datetime.now(UTC)
+    last = read_last_success()
+    if last is None:
+        return True, "no successful pass on record"
+
+    stale_hours = (now - last).total_seconds() / 3600.0
+    if stale_hours >= MAX_STALE_HOURS:
+        return True, f"{stale_hours:.0f}h since the last pass"
+    if last.astimezone().date() == now.astimezone().date():
+        return False, "already consolidated today"
+
+    newest = newest_l0()
+    if newest is None:
+        return True, "nothing has arrived to wait on"
+    quiet_minutes = (now - newest).total_seconds() / 60.0
+    if quiet_minutes < POLL_QUIET_MINUTES:
+        return False, f"only {quiet_minutes:.0f}m quiet"
+    return True, f"{quiet_minutes:.0f}m quiet"
 
 
 # ---------------------------------------------------------------------------
@@ -310,12 +415,22 @@ def _coherent_pair(members: list[dict]) -> tuple[str | None, str | None]:
     invention to an ACTIVE belief, so the memory ends up asserting a causal
     claim nobody ever observed. Diverse members therefore carry NO pair: a
     missing belief is recoverable, a fabricated one is not.
+
+    Silence is diversity too. Discarding the members that state no pair and then
+    agreeing with whoever is left lets a digest of twelve episodes inherit the
+    pair of the one episode that had one, and assert it on behalf of the other
+    eleven — observed here as ``l2:94ef7d7debec6f62`` claiming
+    ``tool_call:Bash -> tool_error`` on the strength of a single member. A pair
+    is inherited only when EVERY member states it.
     """
-    pairs = {
+    paired = [
         (" ".join((m.get("cause") or "").split()), " ".join((m.get("effect") or "").split()))
         for m in members
         if (m.get("cause") or "").strip() and (m.get("effect") or "").strip()
-    }
+    ]
+    if not members or len(paired) != len(members):
+        return (None, None)
+    pairs = set(paired)
     return pairs.pop() if len(pairs) == 1 else (None, None)
 
 
@@ -403,21 +518,32 @@ def pass2_compress(
     dry_run: bool = False,
     now: datetime | None = None,
     singleton_after_days: float = SINGLETON_EPISODE_AFTER_DAYS,
+    quiet_hours: float = SESSION_QUIET_HOURS,
 ) -> dict:
     """Build the abstraction ladder: episodes, then digests, then axioms.
 
     Each rung only consumes rows that no higher rung has claimed, so the ladder
     is stable across runs: yesterday's episodes are not re-episoded tonight.
 
+    A session is not folded until it has been silent for ``quiet_hours``. An
+    episode is meant to describe a whole session, and a pass landing mid-session
+    would mint one from whatever rows happened to exist at that instant; since
+    the member set can no longer change once the window has elapsed, the ladder
+    comes out the same whether this runs once a day or nine times — see
+    ``SESSION_QUIET_HOURS``.
+
     A session below ``MIN_MEMBERS`` normally waits for a sibling that may still
     arrive. Once it is older than ``singleton_after_days`` that wait is over and
     it is promoted alone — see ``SINGLETON_EPISODE_AFTER_DAYS``.
     """
     now = now or datetime.now(UTC)
-    stats = {"l1": 0, "l1_singletons": 0, "l2": 0, "l3": 0}
+    stats = {"l1": 0, "l1_singletons": 0, "l1_deferred": 0, "l2": 0, "l3": 0}
 
-    # L0 -> L1: one episode per session.
+    # L0 -> L1: one episode per session, once that session has fallen silent.
     for session, members in sorted(_group_l0_by_session(l0_rows).items()):
+        if not _is_settled(members, now, quiet_hours / 24.0):
+            stats["l1_deferred"] += 1
+            continue
         label = session if session.startswith("day:") else f"session {session}"
         singleton = len(members) < MIN_MEMBERS[L1_EPISODE] and _is_settled(
             members, now, singleton_after_days
@@ -632,7 +758,8 @@ def format_report(stats: dict) -> str:
         f"{prefix}Dream cycle complete in {stats['duration_sec']}s\n"
         f"  Pass 1 ingest:    {p1['scanned']} scanned, {p1['enriched']} enriched\n"
         f"  Pass 2 compress:  {p2['l1']} episodes ({p2.get('l1_singletons', 0)} singleton), "
-        f"{p2['l2']} digests, {p2['l3']} axioms\n"
+        f"{p2['l2']} digests, {p2['l3']} axioms"
+        f" — {p2.get('l1_deferred', 0)} sessions still live\n"
         f"  Pass 3 reconcile: {p3['asserted']} asserted, {p3['superseded']} superseded, "
         f"{p3['rejected']} rejected, {p3['unchanged']} unchanged, {p3['shadowed']} shadowed\n"
         f"  Pass 4 decay:     {p4['total_decayed']} volumes "
@@ -671,6 +798,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Block on the writer lock instead of exiting when a run is in progress.",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Consolidate now, ignoring the quiet window and the once-a-day cap.",
+    )
     return parser
 
 
@@ -681,13 +813,27 @@ def main(argv: list[str] | None = None) -> int:
     else:
         db.init_schema()
 
+    # A dry run writes nothing, so it cannot skew the ladder and is never gated.
+    gated = not (args.force or args.dry_run)
+    if gated:
+        go, why = should_run()
+        if not go:
+            if not args.nightly:
+                print(f"dream: skipped — {why} (--force overrides)", file=sys.stderr)
+            return 0
+
     try:
         with single_writer(blocking=args.wait):
+            # Two polls can both pass the gate before either takes the lock.
+            if gated and not should_run()[0]:
+                return 0
             stats = consolidate(
                 l0_ttl_days=args.l0_ttl_days,
                 ingest_limit=args.ingest_limit,
                 dry_run=args.dry_run,
             )
+            if not args.dry_run:
+                write_last_success(datetime.now(UTC))
     except DreamLockBusy as exc:
         # Not an error: the nightly job overlapping a manual run is normal.
         print(f"dream: skipped — {exc}", file=sys.stderr)
