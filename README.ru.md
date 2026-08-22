@@ -1,6 +1,6 @@
 # <img src="docs/icons/brain.svg" width="28" alt="" /> Crystallized
 
-<a href="https://web.tribute.tg/d/Huc">
+<a href="https://app.tonkeeper.com/transfer/UQAhzOYPIBQthqrwCFcIpsWUZjmi4KrK3BuGnjAQmJW04IC8">
   <img src="https://img.shields.io/badge/Sponsor-ea4aaa?style=for-the-badge&logo=github-sponsors&logoColor=white" alt="Sponsor">
 </a>
 
@@ -86,9 +86,11 @@ cd crystallized
 
 ## <img src="docs/icons/heart.svg" width="22" alt="" /> Поддержать проект
 
-Если Crystallized экономит твои нервы и время:
+Прямые донаты без комиссий посредников (0% налога):
 
-- [Tribute (карты и крипта)](https://web.tribute.tg/d/Huc)
+- **TON / USDT (TON)**: [`UQAhzOYPIBQthqrwCFcIpsWUZjmi4KrK3BuGnjAQmJW04IC8`](https://app.tonkeeper.com/transfer/UQAhzOYPIBQthqrwCFcIpsWUZjmi4KrK3BuGnjAQmJW04IC8) (открыть в Tonkeeper / кошельке)
+- **USDT (TRC-20)**: `TGHVN7y5EhZ4pAreAXbffKY86kpq1dve9h` (для переводов с бирж)
+- **Карты (РФ / мир)**: [Tribute](https://web.tribute.tg/d/Huc) (если нет крипты)
 
 ---
 
