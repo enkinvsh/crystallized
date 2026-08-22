@@ -1,6 +1,6 @@
 # <img src="docs/icons/brain.svg" width="28" alt="" /> Crystallized
 
-<a href="#поддержать-проект">
+<a href="https://web.tribute.tg/d/Huc">
   <img src="https://img.shields.io/badge/Sponsor-ea4aaa?style=for-the-badge&logo=github-sponsors&logoColor=white" alt="Sponsor">
 </a>
 
