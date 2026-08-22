@@ -40,29 +40,25 @@ CHROMA_DIR = Path(
         str(Path.home() / ".config" / "opencode" / "memory" / "chroma_db"),
     )
 )
-REDIS_PREFIX = "opencode:memory"
-VOLUME_INDEX_KEY = f"{REDIS_PREFIX}:volume_index"
+MEMORY_DB = Path(
+    os.environ.get(
+        "OPENCODE_MEMORY_DB",
+        str(Path.home() / ".config" / "opencode" / "memory" / "memory.db"),
+    )
+)
 QUERY_SOCKET = os.environ.get("OPENCODE_MEMORY_SOCKET", "/tmp/opencode-memory-query.sock")
 
-_redis_conn = None
 
-
-def get_redis():
-    global _redis_conn
-    if _redis_conn is None:
-        import redis
-
-        url = os.environ.get("REDIS_URL")
-        if url:
-            _redis_conn = redis.Redis.from_url(url, decode_responses=True)
-        else:
-            host = os.environ.get("REDIS_HOST", "localhost")
-            port = int(os.environ.get("REDIS_PORT", "6379"))
-            db = int(os.environ.get("REDIS_DB", "0"))
-            _redis_conn = redis.Redis(
-                host=host, port=port, db=db, decode_responses=True
-            )
-    return _redis_conn
+def memory_ro_conn() -> sqlite3.Connection | None:
+    """Open the memory store READ-ONLY. Hooks must never write or migrate."""
+    if not MEMORY_DB.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{MEMORY_DB}?mode=ro", uri=True, timeout=1.0)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except sqlite3.Error:
+        return None
 
 
 def query_semantic(message: str, n_facts: int = 10, n_semantic: int = 5) -> dict | None:
@@ -96,16 +92,21 @@ def query_semantic(message: str, n_facts: int = 10, n_semantic: int = 5) -> dict
 
 
 def get_top_volume_entries(top_n: int = 5) -> list[str]:
-    try:
-        r = get_redis()
-        entries = r.zrevrange(VOLUME_INDEX_KEY, 0, top_n - 1, withscores=True)
-    except Exception:
+    conn = memory_ro_conn()
+    if conn is None:
         return []
+    try:
+        rows = conn.execute(
+            "SELECT entity_key, volume FROM volumes "
+            "ORDER BY volume DESC, entity_key ASC LIMIT ?",
+            (top_n,),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
 
-    result = []
-    for entry_key, score in entries:  # type: ignore[union-attr]
-        result.append(f"  {entry_key} (vol:{score:.0f})")
-    return result
+    return [f"  {row['entity_key']} (vol:{float(row['volume']):.0f})" for row in rows]
 
 
 def get_semantic_count() -> int:
@@ -217,39 +218,27 @@ def extract_keywords(message: str) -> list[str]:
 def get_relevant_facts_keyword(
     keywords: list[str], top_n: int = 20
 ) -> tuple[list[str], int]:
-    try:
-        r = get_redis()
-        raw_facts = r.hgetall(f"{REDIS_PREFIX}:facts")
-    except Exception:
+    conn = memory_ro_conn()
+    if conn is None:
         return [], -1
-
-    if not raw_facts:
-        return [], 0
-
-    parsed_facts = []
-    for key, raw in raw_facts.items():  # type: ignore[union-attr]
-        try:
-            parsed = json.loads(raw)
-            value = parsed.get("value", "")
-            parsed_facts.append((key, value))
-        except (json.JSONDecodeError, ValueError):
-            continue
-
-    if not parsed_facts:
-        return [], 0
-
     try:
-        r = get_redis()
-        pipe = r.pipeline()
-        for key, _ in parsed_facts:
-            pipe.zscore(VOLUME_INDEX_KEY, f"fact:{key}")
-        scores = pipe.execute()
-    except Exception:
-        scores = [50.0] * len(parsed_facts)
+        rows = conn.execute(
+            "SELECT f.key AS key, f.value AS value, v.volume AS volume "
+            "FROM facts f LEFT JOIN volumes v ON v.entity_key = 'fact:' || f.key"
+        ).fetchall()
+    except sqlite3.Error:
+        return [], -1
+    finally:
+        conn.close()
+
+    if not rows:
+        return [], 0
 
     facts = []
-    for i, (key, value) in enumerate(parsed_facts):
-        volume = scores[i] if scores[i] is not None else 50.0
+    for row in rows:
+        key = row["key"]
+        value = row["value"] or ""
+        volume = float(row["volume"]) if row["volume"] is not None else 50.0
         key_lower = key.lower()
         val_lower = value.lower()
         match_score = (
@@ -322,7 +311,7 @@ def main():
         keywords = extract_keywords(user_message) if user_message else []
         fact_lines, fact_total = get_relevant_facts_keyword(keywords)
         if fact_total == -1:
-            sections.append("[Memory] Facts: Redis unavailable")
+            sections.append("[Memory] Facts: store unavailable")
         elif fact_total > 0:
             header = (
                 f"[Memory] Relevant facts ({fact_total} matched)"

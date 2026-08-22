@@ -1,0 +1,43 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "MEMORY_PATH/.venv/bin/python MEMORY_PATH/memory-inject.py",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "MEMORY_PATH/.venv/bin/python MEMORY_PATH/own-voice.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "MEMORY_PATH/.venv/bin/python MEMORY_PATH/observer.py --post-tool",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "MEMORY_PATH/.venv/bin/python MEMORY_PATH/observer.py --session-end",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

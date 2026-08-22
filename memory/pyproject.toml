@@ -1,20 +1,19 @@
 [project]
 name = "opencode-memory"
-version = "1.1.0"
-description = "Three-layer MCP memory server: Redis facts + ChromaDB semantic + filesystem docs"
+version = "2.0.0"
+description = "Self-evolving MCP memory & belief engine: SQLite WAL + Causal Memories + ChromaDB semantic + file docs"
 requires-python = ">=3.11,<3.14"
 dependencies = [
     "mcp[cli]>=1.9.0",
-    "redis>=5.0.0",
     "chromadb>=1.0.0",
     "sentence-transformers>=3.0.0",
+    "httpx[socks]>=0.28.1",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
-    "fakeredis>=2.20",
     "ruff>=0.5",
     "pyright>=1.1.350",
 ]

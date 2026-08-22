@@ -22,12 +22,16 @@
 
 # Crystallized — persistent memory and identity for opencode
 
-Crystallized is a persistent memory MCP server for [opencode](https://opencode.ai), the AI coding agent — it gives your agent long-term memory across sessions. It combines three storage layers — Redis facts, ChromaDB semantic vector search, and markdown documents — under power-law memory decay, so important context stays loud while old noise fades and nothing is deleted. On top of memory it forms an evolving agent identity and ships first-party Anthropic authentication, letting you use your Claude Max plan in opencode without third-party client detection.
+Crystallized is a persistent memory MCP server for [opencode](https://opencode.ai), the AI coding agent — it gives your agent long-term memory across sessions. It combines three storage layers — a SQLite fact store, ChromaDB semantic vector search, and markdown documents — under power-law memory decay, so important context stays loud while old noise fades and nothing is deleted. On top of memory it forms an evolving agent identity and ships first-party Anthropic authentication, letting you use your Claude Max plan in opencode without third-party client detection.
+
+**v2.0 runs with no external services.** There is no Redis, no broker, and no daemon to babysit; the whole store is a single SQLite database in WAL mode plus plain files under your home directory.
 
 ## What you get
 
-- **Three-layer memory**: Redis for instant facts, ChromaDB for semantic search across sessions, filesystem for structured documents
+- **Three-layer memory**: SQLite for instant facts and beliefs, ChromaDB for semantic search across sessions, filesystem for structured documents
+- **Zero external services**: one SQLite file in WAL mode, no Redis, no server to keep running
 - **Automatic memory injection**: every prompt gets enriched with relevant context from previous conversations
+- **Causal observation**: tool results and session transcripts are mined for friction signals and consolidated into beliefs
 - **Agent identity**: beliefs, focus areas, and observations start empty and crystallize over time through work
 - **Memory decay**: power-law fading; important things stay loud, old noise goes quiet, nothing is deleted
 - **First-party auth**: OAuth tokens extracted from Claude.app; your Max plan, not the $200 third-party credit pool
@@ -36,9 +40,10 @@ Crystallized is a persistent memory MCP server for [opencode](https://opencode.a
 ## Requirements
 
 - **macOS** (primary) or Linux
-- **Python 3.11+**
-- **[Claude.app](https://claude.ai/download)**: installed and logged in with your Max account
-- **[Homebrew](https://brew.sh)** on macOS
+- **Python 3.11+**, **git**, **curl**
+- **[Claude.app](https://claude.ai/download)**: installed and logged in with your Max account (macOS, for first-party token extraction)
+
+Homebrew is only used as a fallback when an optional extraction tool such as `unzip` is missing. Nothing else needs it.
 
 ## Quick start
 
@@ -50,7 +55,13 @@ cd crystallized
 opencode
 ```
 
-The installer handles Redis, Python deps, opencode CLI, memory server, config, and auth extraction.
+The installer handles Python deps, the opencode CLI, the memory server, the SQLite schema, config merging, hooks, the nightly job, and auth extraction.
+
+Preview everything without touching your machine:
+
+```sh
+./install.sh --dry-run
+```
 
 ## Reproducible installs
 
@@ -58,18 +69,40 @@ The repository tracks `memory/uv.lock` so every install resolves to the same Pyt
 
 ## What install.sh does
 
-- Checks prerequisites (Git, Python 3.11+, Homebrew on macOS, jq).
-- Installs and starts Redis via Homebrew (or `apt` on Linux), or shares an existing local Redis on port 6379.
-- Installs the `uv` Python package manager from astral.sh.
-- Installs the `opencode` CLI from GitHub releases if it is not already on PATH.
-- Deploys the memory MCP server scripts to `~/.config/opencode/memory/`.
-- Installs Python dependencies into `~/.config/opencode/memory/.venv` via `uv sync --frozen`.
-- Seeds identity templates (beliefs, focus, observations, journal) into `~/.config/opencode/memory/notes/`.
-- Writes or merges `~/.config/opencode/opencode.json` with the memory MCP entry and pre-prompt hooks. Before merging, it backs up the existing file.
-- On macOS, extracts your Claude.app OAuth tokens via Keychain and writes them to `~/.local/share/opencode/auth.json`.
+1. Checks prerequisites: `git`, `python3` 3.11+, and `curl`.
+2. Installs the `uv` Python package manager from astral.sh if it is missing.
+3. Installs the `opencode` CLI from GitHub releases if it is not already on PATH.
+4. Deploys the memory server modules to `~/.config/opencode/memory/` and records exactly what it copied in `.crystallized-manifest`.
+5. Installs Python dependencies into `~/.config/opencode/memory/.venv` via `uv sync --frozen`.
+6. Initializes the SQLite schema at `~/.config/opencode/memory/memory.db` (WAL mode) by running `python -c "import db; db.init_schema()"`, then prints the resulting `PRAGMA user_version`.
+7. Seeds identity templates (beliefs, focus, observations, journal) into `~/.config/opencode/memory/notes/`.
+8. Merges `~/.config/opencode/opencode.json` with the memory MCP entry and the plugin entry. The existing file is backed up first, and entries you already defined are never overwritten.
+9. Merges the hooks from `config/claude-settings.json` into `~/.claude/settings.json`, creating the file if it does not exist. Only the `hooks` tree is touched; every other key and every foreign hook is preserved, and re-running the installer does not duplicate entries.
+10. Installs the nightly consolidation job: a launchd agent at `~/Library/LaunchAgents/com.crystallized.dream.plist` on macOS, or a marked crontab entry on Linux. It runs daily at 04:00 and logs to `~/.config/opencode/memory/dream.log`.
+11. On macOS, extracts your Claude.app OAuth tokens via Keychain and writes them to `~/.local/share/opencode/auth.json`.
+
+### Installer flags
+
+| Flag | Effect |
+|---|---|
+| `--dry-run` | Print every action; change nothing on disk |
+| `--no-hooks` | Skip Claude Code hook registration in `~/.claude/settings.json` |
+| `--no-daemon` | Skip the nightly consolidation job (launchd / cron) |
+| `--offline` | Never reach the network; fail instead of downloading |
+| `--help`, `-h` | Show usage and exit |
+
+### Hooks the installer registers
+
+| Event | Command | Purpose |
+|---|---|---|
+| `UserPromptSubmit` | `memory-inject.py` | Prepends relevant memory to the prompt |
+| `UserPromptSubmit` | `own-voice.py` | Prepends the agent's evolving identity |
+| `PostToolUse` | `observer.py --post-tool` | Captures friction signals from tool results |
+| `Stop` | `observer.py --session-end` | Mines the finished transcript for observations |
 
 ## What install.sh does NOT do
 
+- Does not install, start, or require Redis. v2.0 removed it entirely.
 - Does not modify Claude.app or its files.
 - Does not change your shell rc files. If `opencode` is not on PATH after install, the installer prints a one-line `export PATH=...` hint for you to add yourself.
 - Does not phone home. No telemetry, no analytics, no remote logging.
@@ -82,28 +115,52 @@ The repository tracks `memory/uv.lock` so every install resolves to the same Pyt
 - Linux skips the automatic auth step. You need to extract tokens from a Mac, or use an API key directly, or accept third-party routing.
 - The installer assumes a single-user Mac. Multi-user shared installs are not supported.
 - ChromaDB cold start can take 10 to 30 seconds on the first MCP call while the sentence-transformer model downloads.
+- The memory directory is shared with anything else you keep there. `uninstall.sh` removes only what the install manifest lists, so your own scripts in that folder are left alone.
+
+## Uninstalling
+
+```sh
+./uninstall.sh            # prompts before deleting memory data
+./uninstall.sh --keep-data
+./uninstall.sh --purge
+./uninstall.sh --dry-run
+```
+
+`uninstall.sh` unloads and deletes the launchd agent (or removes the cron entry), unregisters the Crystallized hooks from `~/.claude/settings.json` while leaving foreign hooks intact, removes the memory MCP entry from `opencode.json`, deletes the deployed modules and `.venv`, and — only if you agree — removes `memory.db` together with its `-wal` and `-shm` siblings, plus `notes/`, `chroma_db/`, `identity.json`, and any leftover `vault/` from a pre-2.0 install.
 
 ## Optional runtime environment variables
 
-All runtime environment variables are optional. If you do not set them, the defaults preserve v1.0 behavior.
+All runtime environment variables are optional. The defaults are the paths the installer uses.
 
 | Variable | Purpose |
 |---|---|
-| `REDIS_URL` | Full Redis connection URL. |
-| `REDIS_HOST` | Redis host when `REDIS_URL` is not set. |
-| `REDIS_PORT` | Redis port when `REDIS_URL` is not set. |
-| `REDIS_DB` | Redis database number. |
-| `OPENCODE_MEMORY_SOCKET` | MCP socket path for memory hooks. |
+| `OPENCODE_MEMORY_DB` | Path to the SQLite memory database. |
 | `OPENCODE_MEMORY_NOTES_DIR` | Notes directory for saved documents and identity files. |
 | `OPENCODE_MEMORY_CHROMA_DIR` | ChromaDB persistence directory. |
+| `OPENCODE_MEMORY_IDENTITY` | Path to the exported volume map. |
+| `OPENCODE_MEMORY_SOCKET` | Unix socket the hooks use to reach the warm encoder. |
+| `OPENCODE_MEMORY_DISABLE_CHROMA_API` | Set to `0` to re-enable the in-process ChromaDB API. Defaults to disabled. |
+| `CRYSTALLIZED_OBSERVER_BUDGET_MS` | Observer hook deadline in milliseconds. |
 
-## Upgrading from v1.0
+## Upgrading from v1.x
 
-Pull the new code, then re-run `./install.sh`. The installer backs up `opencode.json` before merging the new memory hooks and MCP config.
+v2.0 replaces the Redis fact layer with SQLite. Pull the new code and re-run the installer:
 
-The new environment variables are optional. If you do not set them, the defaults preserve v1.0 behavior.
+```sh
+git pull
+./install.sh
+```
 
-If something breaks, run `./uninstall.sh`, then re-run `./install.sh`.
+The installer backs up `opencode.json` and `~/.claude/settings.json` before merging, so nothing you configured is lost. After the upgrade you can stop Redis if you started it only for Crystallized:
+
+```sh
+brew services stop redis     # macOS
+sudo systemctl stop redis    # Linux
+```
+
+The `REDIS_URL`, `REDIS_HOST`, `REDIS_PORT`, and `REDIS_DB` variables are no longer read by anything.
+
+If something breaks, run `./uninstall.sh --keep-data`, then re-run `./install.sh`.
 
 See [CHANGELOG.md](CHANGELOG.md) for full release notes.
 
@@ -115,17 +172,23 @@ Crystallized extracts tokens directly from Claude.app. These carry Claude's own 
 
 ## How it works
 
-### Three-layer memory architecture (Redis + ChromaDB + filesystem)
+### Three-layer memory architecture (SQLite + ChromaDB + filesystem)
 
-`memory-inject.py` runs as a pre-prompt hook on every message. It searches all three layers for relevant context and prepends it:
+`memory-inject.py` runs as a pre-prompt hook on every message. It searches the layers for relevant context and prepends it:
 
 | Layer | Engine | Purpose |
 |---|---|---|
-| Facts | Redis | Names, decisions, preferences, instant key/value lookups |
+| Facts and beliefs | SQLite (WAL) | Names, decisions, preferences, instant key/value lookups |
 | Semantic | ChromaDB | Vector similarity across everything the agent ever remembered |
 | Documents | Filesystem | Architecture notes, checklists, session summaries |
 
 Decay runs on a power-law schedule. Memories are never deleted, they get quieter.
+
+### Observation and nightly consolidation
+
+`observer.py` runs on `PostToolUse` and `Stop`. It applies regex patterns to tool output and finished transcripts, and writes raw `layer=0` rows into `causal_memories`. It is deliberately cheap: it has a millisecond budget, always exits `0`, and never prints on the tool path, so a hook can never abort or slow down a turn.
+
+The expensive half runs while you are not working. The nightly job promotes raw observations upward — raw signal to episode to pattern to principle — and resolves contradictions into `belief_state`, a bi-temporal table where exactly one belief per subject and predicate can be active at a time. Superseded beliefs are marked, not deleted, so the history of what the agent used to think stays queryable.
 
 ### Identity
 
@@ -141,16 +204,30 @@ Decay runs on a power-law schedule. Memories are never deleted, they get quieter
 ~/.config/opencode/
 ├── opencode.json              # MCP servers, plugins
 └── memory/
-    ├── server.py              # MCP memory server (Redis + ChromaDB + fs)
-    ├── memory-inject.py       # Pre-prompt hook: context injection
-    ├── own-voice.py           # Pre-prompt hook: identity injection
+    ├── server.py              # MCP memory server (SQLite + ChromaDB + fs)
+    ├── db.py                  # SQLite storage layer, schema migrations
+    ├── volume.py              # Power-law decay math
+    ├── observer.py            # Hook: PostToolUse / Stop signal capture
+    ├── patterns.py            # Regex patterns the observer applies
+    ├── dream.py               # Nightly consolidation pass
+    ├── memory-inject.py       # Hook: context injection
+    ├── own-voice.py           # Hook: identity injection
     ├── pyproject.toml         # Python dependencies
+    ├── .crystallized-manifest # What install.sh deployed (used by uninstall.sh)
+    ├── memory.db              # SQLite store, WAL mode (generated)
     ├── chroma_db/             # Vector database (generated)
     ├── notes/self/            # Agent identity (generated)
     │   ├── beliefs.md
     │   ├── focus.md
     │   └── observations.md
-    └── identity.json          # Volume map (generated)
+    ├── identity.json          # Volume map (generated)
+    └── dream.log              # Nightly job output (generated)
+
+~/.claude/
+└── settings.json              # Hook registrations (merged, never overwritten)
+
+~/Library/LaunchAgents/
+└── com.crystallized.dream.plist   # Nightly consolidation (macOS)
 
 ~/.local/share/opencode/
 └── auth.json                  # OAuth tokens (from Claude.app)
@@ -164,7 +241,28 @@ python3 auth/extract_token.py
 ```
 Try each index if you have multiple workspaces.
 
-**Memory MCP is red**, `redis-cli ping` should return PONG. Also verify the `uv` path in `opencode.json` is absolute. The installer handles this, but manual edits can break it.
+**Memory MCP is red**, verify the `uv` path in `opencode.json` is absolute. The installer writes it that way, but manual edits can break it. Then check the store opens:
+
+```sh
+cd ~/.config/opencode/memory && .venv/bin/python -c "import db; db.init_schema(); print('ok')"
+```
+
+**Hooks are not firing**, confirm they are registered and that the interpreter path exists:
+
+```sh
+python3 -c "import json;print(json.load(open('$HOME/.claude/settings.json'))['hooks'].keys())"
+ls ~/.config/opencode/memory/.venv/bin/python
+```
+
+Re-run `./install.sh` to re-register; it will not duplicate existing entries.
+
+**Nightly job never runs**, check it is loaded and read the log:
+
+```sh
+launchctl list | grep crystallized      # macOS
+crontab -l | grep crystallized-dream    # Linux
+tail ~/.config/opencode/memory/dream.log
+```
 
 **Keychain access denied**, needs GUI terminal, not pure SSH. Or unlock first:
 ```sh
@@ -175,7 +273,7 @@ security unlock-keychain ~/Library/Keychains/login.keychain-db
 
 ## Development
 
-The memory server is a standalone Python package managed with [uv](https://astral.sh). Run the test suite (67 pytest tests covering facts, semantic search, decay, and identity):
+The memory server is a standalone Python package managed with [uv](https://astral.sh). Run the test suite:
 
 ```sh
 cd memory && uv run pytest tests/ -q
@@ -185,6 +283,14 @@ Lint with ruff before sending a change:
 
 ```sh
 uv run ruff check .
+```
+
+The shell scripts are checked with `bash -n`, and `--dry-run` on both scripts is the fastest way to review a change end to end:
+
+```sh
+bash -n install.sh && bash -n uninstall.sh
+./install.sh --dry-run
+./uninstall.sh --dry-run
 ```
 
 Release notes live in [CHANGELOG.md](CHANGELOG.md); the threat model and disclosure policy live in [SECURITY.md](SECURITY.md).
@@ -198,7 +304,10 @@ By default, yes — each session starts cold. Crystallized fixes this: it persis
 The memory server is a standard [Model Context Protocol](https://modelcontextprotocol.io) server, so any MCP client can connect to it. The installer, pre-prompt hooks, and identity injection are tailored to opencode, so other clients get the memory tools but not the automatic context injection.
 
 **Is my data sent anywhere?**
-No. Memory lives entirely on your machine — Redis, ChromaDB, and markdown files on local disk. There is no telemetry, no analytics, and no remote logging. See [SECURITY.md](SECURITY.md) for the full threat model.
+No. Memory lives entirely on your machine — one SQLite file, ChromaDB, and markdown files on local disk. Nothing listens on a network port. There is no telemetry, no analytics, and no remote logging. See [SECURITY.md](SECURITY.md) for the full threat model.
+
+**Do I still need Redis?**
+No. v2.0 removed it. Facts, beliefs, volumes, and the event log all live in a single SQLite database in WAL mode, so there is no service to install, start, or keep alive.
 
 **Why does Anthropic route opencode to a $200 credit pool?**
 Anthropic detects third-party clients by their OAuth `client_id` and bills them against a separate credit pool instead of your subscription. Crystallized extracts first-party tokens from Claude.app, so opencode is treated as first-party and your Claude Max plan limits apply normally.

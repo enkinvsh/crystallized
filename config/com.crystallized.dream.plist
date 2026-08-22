@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Nightly memory consolidation (dream.py) for crystallized.
+
+  Template: MEMORY_PATH is replaced with the install destination
+  (default: ~/.config/opencode/memory) by install.sh.
+
+  Install manually:
+      sed "s|MEMORY_PATH|$HOME/.config/opencode/memory|g" \
+        config/com.crystallized.dream.plist \
+        > ~/Library/LaunchAgents/com.crystallized.dream.plist
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.crystallized.dream.plist
+
+  Uninstall:
+      launchctl bootout gui/$(id -u)/com.crystallized.dream
+
+  Notes:
+    * RunAtLoad is false — consolidation is a *nightly* batch job, not a
+      login-time one. Loading the agent must never kick off a full pass while
+      the user is starting a session.
+    * A missed 04:00 (laptop asleep) is run by launchd once the machine wakes.
+      dream.py is idempotent, so a late or repeated run is harmless.
+    * dream.py takes an exclusive flock on <db>-dream.lock and exits 0 when a
+      run is already in progress, so overlapping with a manual trigger is safe.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.crystallized.dream</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>MEMORY_PATH/.venv/bin/python</string>
+        <string>MEMORY_PATH/dream.py</string>
+        <string>--nightly</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>MEMORY_PATH</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>LowPriorityIO</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>MEMORY_PATH/dream.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>MEMORY_PATH/dream.log</string>
+</dict>
+</plist>
