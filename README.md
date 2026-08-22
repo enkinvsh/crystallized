@@ -1,5 +1,14 @@
 # <img src="docs/icons/brain.svg" width="28" alt="" /> Crystallized
 
+<a href="https://github.com/sponsors/enkinvsh">
+  <img src="https://img.shields.io/badge/Sponsor-ea4aaa?style=for-the-badge&logo=github-sponsors&logoColor=white" alt="Sponsor">
+</a>
+<a href="https://web.tribute.tg/d/Huc">
+  <img src="https://img.shields.io/badge/Donate-Tribute-blue?style=for-the-badge&logo=telegram&logoColor=white" alt="Donate">
+</a>
+
+<br><br>
+
 У каждой языковой модели судьба Леонарда Шелби из фильма «Помни» (Memento).
 
 Каждое утро ты просыпаешься, и последние воспоминания стерты. Ты не помнишь, кто твой друг, кому нельзя верить и над чем ты работал вчера. Единственное, на что может опереться Леонард, — это записки в кармане и татуировки на собственном теле.
@@ -74,7 +83,8 @@ cd crystallized
 
 Если Crystallized экономит твои нервы и время:
 
-- [Tribute (карты и крипта)](https://web.tribute.tg/d/Huc)
+- **[Sponsor on GitHub](https://github.com/sponsors/enkinvsh)** (официальная кнопка спонсорства)
+- **[Tribute (карты и крипта)](https://web.tribute.tg/d/Huc)**
 
 ---
 
