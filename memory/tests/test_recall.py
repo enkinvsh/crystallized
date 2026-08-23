@@ -10,7 +10,53 @@ from conftest, which redirects every path into tmp_path and forces the SQLite
 semantic fallback, so nothing here touches ~/.config/opencode/memory.
 """
 
+import numpy as np
+import pytest
+
 import db
+import server
+
+VEC_MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
+VEC_DIM = 8
+
+
+def _basis(i: int) -> np.ndarray:
+    v = np.zeros(VEC_DIM, dtype=np.float32)
+    v[i] = 1.0
+    return v
+
+
+def _at_cosine(target: float) -> bytes:
+    """A unit vector whose dot with the fixture query vector is `target`."""
+    v = target * _basis(0) + np.sqrt(max(0.0, 1.0 - target * target)) * _basis(1)
+    return (v / np.linalg.norm(v)).astype("<f4").tobytes()
+
+
+class _CountingEncoder:
+    """Returns one fixed query vector and counts how often it was asked."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def encode(self, text, **_kwargs):
+        self.calls += 1
+        return _basis(0).copy()
+
+
+@pytest.fixture
+def vec(srv, monkeypatch):
+    """`recall` with a stub encoder and an empty, isolated vector store."""
+    encoder = _CountingEncoder()
+    monkeypatch.setattr(server, "get_encoder", lambda: encoder)
+    monkeypatch.setattr(server, "EMBED_MODEL_NAME", VEC_MODEL)
+    server._invalidate_vector_cache()
+    yield srv, encoder
+    server._invalidate_vector_cache()
+
+
+def _embed(kind: str, key: str, cosine: float) -> None:
+    db.embedding_upsert(kind, key, [_at_cosine(cosine)], model=VEC_MODEL, dim=VEC_DIM)
+    server._invalidate_vector_cache()
 
 #: The live row, with the punctuation and the word forms it actually has.
 #: A fixture that paraphrases the stored text flatters the matcher: «помечай»
@@ -218,3 +264,120 @@ class TestRecallStillDoesEverythingItDidBefore:
         out = srv.recall("предполагаемый риск")
 
         assert "Causal memories:" in out
+
+
+# ===========================================================================
+# Stage B — vector retrieval tops up every section
+# ===========================================================================
+
+
+class TestVectorTopsUpEachSection:
+    """Vector hits are ADDED to each section, never substituted for it.
+
+    Exact and id matching is precise and already works — «unmeasured-risk»
+    found its row by an id fragment. Vectors add paraphrase and inflection
+    reach on top. Searching per KIND rather than globally is what makes this
+    usable: on the live store a document averages 30.2 chunks against a causal
+    row's 1.9, so a global max-over-chunks hands verbose prose ~15x more
+    chances to throw a high score than a precise lesson.
+    """
+
+    def test_a_paraphrase_only_lesson_is_reachable(self, vec):
+        """The case that failed all day: no shared substring, no shared token."""
+        srv, _ = vec
+        db.causal_insert(
+            id="2026-08-23-unmeasured-risk-stated-as-fact",
+            text="ГИПОТЕЗА, НЕ ИЗМЕРЕНО: помечать предполагаемый риск явно",
+            confidence=0.9, layer=2, tags="lesson",
+        )
+        _embed("causal", "2026-08-23-unmeasured-risk-stated-as-fact", 0.553)
+
+        out = srv.recall("как отличать догадку от проверенного факта в документах")
+
+        assert "Causal memories:" in out
+        assert "2026-08-23-unmeasured-risk-stated-as-fact" in out
+
+    def test_vector_lines_are_visibly_marked(self, vec):
+        srv, _ = vec
+        db.causal_insert(id="lesson", text="некий урок", confidence=0.9)
+        _embed("causal", "lesson", 0.62)
+
+        line = next(
+            ln for ln in srv.recall("совершенно иной запрос").splitlines()
+            if "lesson" in ln
+        )
+
+        assert "[vec" in line
+
+    def test_an_exact_match_is_never_displaced_by_a_vector_hit(self, vec):
+        """A vector hit may join the results; it may not evict a literal one."""
+        srv, _ = vec
+        db.fact_set("db_choice", {"value": "sqlite", "ttl_days": 90})
+        for i in range(8):
+            db.fact_set(f"filler{i}", {"value": "нерелевантно", "ttl_days": 90})
+            _embed("fact", f"filler{i}", 0.99)
+
+        out = srv.recall("db_choice")
+
+        assert "db_choice" in out
+        facts = next(s for s in out.split("\n\n") if s.startswith("Facts:"))
+        assert "db_choice" in facts.splitlines()[1]  # still the first line
+
+    def test_a_record_matching_both_ways_appears_once(self, vec):
+        srv, _ = vec
+        db.causal_insert(id="both", text="догадка выдана за факт", confidence=0.9)
+        _embed("causal", "both", 0.9)
+
+        out = srv.recall("догадка")
+
+        assert out.count("both") == 1
+
+    def test_a_document_cannot_surface_in_the_causal_section(self, vec):
+        """Each section is searched with its OWN kind."""
+        srv, _ = vec
+        (srv.NOTES_DIR / "notes.md").write_text("многословная проза", "utf-8")
+        _embed("doc", "notes", 0.99)
+        db.causal_insert(id="lesson", text="точный урок", confidence=0.9)
+        _embed("causal", "lesson", 0.40)
+
+        out = srv.recall("запрос без общих слов")
+        causal = next(s for s in out.split("\n\n") if s.startswith("Causal memories:"))
+
+        assert "lesson" in causal
+        assert "notes" not in causal
+        assert "Documents:" in out
+
+    def test_the_query_is_encoded_once_per_call(self, vec):
+        """Four sections, one forward pass: the encode is ~95% of the cost."""
+        srv, encoder = vec
+        db.causal_insert(id="c", text="урок", confidence=0.9)
+        _embed("causal", "c", 0.8)
+        _embed("fact", "f", 0.8)
+        _embed("doc", "d", 0.8)
+        _embed("semantic", "s", 0.8)
+
+        srv.recall("какой-то запрос")
+
+        assert encoder.calls == 1
+
+    def test_min_score_trims_below_threshold_hits(self, vec):
+        srv, _ = vec
+        db.causal_insert(id="near", text="близкий", confidence=0.9)
+        db.causal_insert(id="far", text="далёкий", confidence=0.9)
+        _embed("causal", "near", 0.62)
+        _embed("causal", "far", 0.11)
+
+        out = srv.recall("запрос без общих слов", min_score=0.35)
+
+        assert "near" in out
+        assert "far" not in out
+
+    def test_an_empty_vector_store_changes_nothing(self, vec):
+        """No-regression guard: with no embeddings, `recall` is exactly as before."""
+        srv, _ = vec
+        db.fact_set("db_choice", {"value": "sqlite", "ttl_days": 90})
+
+        out = srv.recall("db_choice")
+
+        assert "Facts:" in out and "sqlite" in out
+        assert "[vec" not in out

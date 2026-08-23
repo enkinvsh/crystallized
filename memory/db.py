@@ -22,7 +22,10 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
+
+if TYPE_CHECKING:  # numpy is imported lazily at runtime; see embedding_load
+    import numpy as np
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -209,11 +212,39 @@ DELETE FROM belief_state
       OR (subject = 'user_message') );
 """
 
+_V5_SCHEMA_SQL = """
+-- Vector store. ONE ROW PER CHUNK, never one per record: the encoder's context
+-- is 128 tokens, about 363 characters of Russian, while the average fact here
+-- is 2697 characters and the longest is 9575. One vector per row would embed
+-- only each row's opening -- 4% of that longest fact -- and a lesson that
+-- states its rule at the END would be permanently unreachable.
+--
+-- `vec` is float32 little-endian and ALREADY NORMALIZED, so cosine similarity
+-- is a plain dot product and nothing has to renormalise at query time.
+--
+-- `model` is recorded per row so that a model swap is DETECTABLE. Vectors from
+-- two different models share no space, and mixing them returns confident
+-- nonsense rather than an error, so search filters on this column instead of
+-- trusting the table to be homogeneous.
+CREATE TABLE IF NOT EXISTS embeddings (
+  kind       TEXT NOT NULL,   -- fact | semantic | causal | doc
+  key        TEXT NOT NULL,
+  chunk_ix   INTEGER NOT NULL,
+  model      TEXT NOT NULL,
+  dim        INTEGER NOT NULL,
+  vec        BLOB NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (kind, key, chunk_ix));
+CREATE INDEX IF NOT EXISTS idx_embeddings_kind  ON embeddings(kind);
+CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(model);
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: _V1_SCHEMA_SQL,
     2: _V2_SCHEMA_SQL,
     3: _V3_SCHEMA_SQL,
     4: _V4_REPAIR_SQL,
+    5: _V5_SCHEMA_SQL,
 }
 
 # ---------------------------------------------------------------------------
@@ -859,6 +890,108 @@ def causal_delete_l0_reapable(l0_ttl_days: int = 7, dry_run: bool = False) -> in
             )
     with write_txn() as c:
         return c.execute(f"DELETE FROM causal_memories {where}", params).rowcount
+
+
+# ---------------------------------------------------------------------------
+# Embeddings (vector store — one row per chunk)
+# ---------------------------------------------------------------------------
+
+EMBEDDING_KINDS = ("fact", "semantic", "causal", "doc")
+
+
+def embedding_upsert(
+    kind: str,
+    key: str,
+    chunks: list[bytes],
+    model: str,
+    dim: int,
+    conn: sqlite3.Connection | None = None,
+) -> int:
+    """Replace EVERY chunk of one key, atomically.
+
+    Delete-then-insert rather than INSERT OR REPLACE: a re-embedded record can
+    yield FEWER chunks than before (an edit that shortens it), and replacing
+    row-by-row would leave the surplus tail behind as orphaned vectors that
+    still answer searches. Wiping the key first is what makes the backfill
+    re-runnable.
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    rows = [
+        (kind, key, ix, model, dim, vec, now_iso)
+        for ix, vec in enumerate(chunks)
+    ]
+
+    def _run(c: sqlite3.Connection) -> None:
+        c.execute("DELETE FROM embeddings WHERE kind = ? AND key = ?", (kind, key))
+        if rows:
+            c.executemany(
+                "INSERT INTO embeddings "
+                "(kind, key, chunk_ix, model, dim, vec, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+
+    if conn is not None:
+        _run(conn)
+    else:
+        with write_txn() as c:
+            _run(c)
+    return len(rows)
+
+
+def embedding_delete(
+    kind: str, key: str, conn: sqlite3.Connection | None = None
+) -> int:
+    """Drop every chunk belonging to one key."""
+    sql = "DELETE FROM embeddings WHERE kind = ? AND key = ?"
+    if conn is not None:
+        return conn.execute(sql, (kind, key)).rowcount
+    with write_txn() as c:
+        return c.execute(sql, (kind, key)).rowcount
+
+
+def embedding_load(
+    kind: str | None = None, model: str | None = None
+) -> tuple[list[dict], np.ndarray]:
+    """Chunk metadata plus the stacked, normalized matrix.
+
+    Returns ``(rows, matrix)`` where ``matrix[i]`` is the vector of ``rows[i]``
+    and every vector is already unit length, so a query is scored by one
+    ``matrix @ q`` and nothing renormalises per search.
+
+    ``numpy`` is imported HERE rather than at module scope on purpose. This
+    module is imported by ``observer.py``, whose whole run must fit in
+    ``BUDGET_MS`` (150 ms), and numpy costs ~27 ms to import — a fifth of that
+    budget, spent on every tool call, for a table the hooks never read.
+    """
+    import numpy as np
+
+    clauses: list[str] = []
+    params: list[str] = []
+    if kind is not None:
+        clauses.append("kind = ?")
+        params.append(kind)
+    if model is not None:
+        clauses.append("model = ?")
+        params.append(model)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+    with read_conn() as c:
+        raw = c.execute(
+            f"SELECT kind, key, chunk_ix, model, dim, vec FROM embeddings "
+            f"{where} ORDER BY kind, key, chunk_ix",
+            tuple(params),
+        ).fetchall()
+
+    rows = [dict(r) for r in raw]
+    if not rows:
+        return [], np.zeros((0, 0), dtype=np.float32)
+
+    dim = int(rows[0]["dim"])
+    matrix = np.frombuffer(
+        b"".join(r["vec"] for r in rows), dtype="<f4"
+    ).reshape(len(rows), dim)
+    return rows, matrix
 
 
 # ---------------------------------------------------------------------------

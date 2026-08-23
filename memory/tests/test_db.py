@@ -340,7 +340,9 @@ class TestMigration4:
         assert _belief_count() == 2
 
     def test_the_schema_version_is_advanced(self, migrated_from_v3):
-        assert _user_version() == 4
+        """Past 4, and on to whatever the newest migration is."""
+        assert _user_version() >= 4
+        assert _user_version() == max(db.MIGRATIONS)
 
     def test_running_it_again_changes_nothing(self, migrated_from_v3):
         def snapshot() -> tuple[list, list, int]:
@@ -358,9 +360,9 @@ class TestMigration4:
         db.init_schema()
         assert snapshot() == before
 
-    def test_a_fresh_database_initialises_straight_to_4(self, tmp_path):
+    def test_a_fresh_database_initialises_straight_to_the_newest(self, tmp_path):
         db.set_db_path(tmp_path / "fresh.sqlite")
-        assert _user_version() == 4
+        assert _user_version() == max(db.MIGRATIONS)
         assert db.fact_count() == 0
 
 
@@ -464,3 +466,97 @@ class TestCausalSearch:
         for i in range(10):
             db.causal_insert(id=f"r{i}", text="повторяющийся текст", confidence=0.5)
         assert len(db.causal_search("повторяющийся", limit=3)) == 3
+
+
+# ---------------------------------------------------------------------------
+# embeddings — one row per CHUNK, migration 5
+# ---------------------------------------------------------------------------
+
+MODEL = "paraphrase-multilingual-MiniLM-L12-v2"
+
+
+def _unit(*values: float) -> bytes:
+    """A normalized float32 little-endian vector, as the table stores them."""
+    import numpy as np
+
+    a = np.asarray(values, dtype=np.float32)
+    return (a / np.linalg.norm(a)).astype("<f4").tobytes()
+
+
+class TestEmbeddingStorage:
+    def test_migration_5_creates_the_table(self):
+        assert _user_version() == 5
+
+    def test_chunks_round_trip_byte_identical(self):
+        chunks = [_unit(1, 0, 0, 0), _unit(0, 1, 0, 0)]
+        db.embedding_upsert("fact", "k1", chunks, model=MODEL, dim=4)
+
+        rows, matrix = db.embedding_load()
+
+        assert [r["vec"] for r in rows] == chunks
+        assert {r["dim"] for r in rows} == {4}
+        assert [r["chunk_ix"] for r in rows] == [0, 1]
+        assert matrix.shape == (2, 4)
+        assert matrix.dtype.str == "<f4"
+
+    def test_the_matrix_rows_align_with_the_metadata_rows(self):
+        import numpy as np
+
+        db.embedding_upsert("fact", "k1", [_unit(1, 0, 0, 0)], model=MODEL, dim=4)
+        db.embedding_upsert("fact", "k2", [_unit(0, 0, 1, 0)], model=MODEL, dim=4)
+
+        rows, matrix = db.embedding_load()
+
+        for i, r in enumerate(rows):
+            assert matrix[i].astype("<f4").tobytes() == r["vec"]
+        assert np.allclose(np.linalg.norm(matrix, axis=1), 1.0)
+
+    def test_reupsert_replaces_chunks_rather_than_appending(self):
+        """The idempotence guard: a re-run of the backfill must not grow rows."""
+        db.embedding_upsert("fact", "k1", [_unit(1, 0, 0, 0)] * 3, model=MODEL, dim=4)
+        db.embedding_upsert("fact", "k1", [_unit(0, 1, 0, 0)], model=MODEL, dim=4)
+
+        rows, _ = db.embedding_load()
+
+        assert len(rows) == 1
+        assert rows[0]["vec"] == _unit(0, 1, 0, 0)
+
+    def test_reupsert_does_not_strand_a_shortened_tail(self):
+        """Re-embedding a shortened record must not leave orphan chunks behind."""
+        db.embedding_upsert("fact", "k1", [_unit(1, 0, 0, 0)] * 5, model=MODEL, dim=4)
+        db.embedding_upsert("fact", "k1", [_unit(1, 0, 0, 0)] * 2, model=MODEL, dim=4)
+
+        rows, _ = db.embedding_load()
+
+        assert [r["chunk_ix"] for r in rows] == [0, 1]
+
+    def test_delete_removes_every_chunk_of_one_key_only(self):
+        db.embedding_upsert("fact", "keep", [_unit(1, 0, 0, 0)], model=MODEL, dim=4)
+        db.embedding_upsert("fact", "drop", [_unit(0, 1, 0, 0)] * 4, model=MODEL, dim=4)
+
+        db.embedding_delete("fact", "drop")
+
+        assert [r["key"] for r in db.embedding_load()[0]] == ["keep"]
+
+    def test_load_can_be_filtered_by_kind(self):
+        db.embedding_upsert("fact", "f", [_unit(1, 0, 0, 0)], model=MODEL, dim=4)
+        db.embedding_upsert("causal", "c", [_unit(0, 1, 0, 0)], model=MODEL, dim=4)
+
+        assert [r["key"] for r in db.embedding_load(kind="causal")[0]] == ["c"]
+
+    def test_load_can_be_filtered_by_model(self):
+        db.embedding_upsert("fact", "new", [_unit(1, 0, 0, 0)], model=MODEL, dim=4)
+        db.embedding_upsert("fact", "old", [_unit(0, 1, 0, 0)], model="older-v1", dim=4)
+
+        assert [r["key"] for r in db.embedding_load(model=MODEL)[0]] == ["new"]
+
+    def test_the_model_name_is_recorded_per_row(self):
+        db.embedding_upsert("fact", "k1", [_unit(1, 0, 0, 0)], model=MODEL, dim=4)
+
+        assert db.embedding_load()[0][0]["model"] == MODEL
+
+    def test_an_empty_table_loads_as_an_empty_result(self):
+        rows, matrix = db.embedding_load()
+
+        assert rows == []
+        assert matrix.shape == (0, 0)

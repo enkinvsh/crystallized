@@ -29,6 +29,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Protocol
 
 import numpy as np
 import chromadb
@@ -76,9 +77,24 @@ _encoder: SentenceTransformer | None = None
 
 
 def get_encoder() -> SentenceTransformer:
+    """The one live SentenceTransformer in this process. Cache-first.
+
+    ``local_files_only=True`` is tried FIRST because sentence-transformers
+    otherwise revalidates every config file against huggingface.co even when
+    the model is fully cached: measured 12.6 s against 0.8 s on this machine,
+    and 57 s on a slow link. That turns a network stall into a memory stall.
+
+    It falls back to a networked load rather than setting ``HF_HUB_OFFLINE``,
+    which would be a hard failure on a machine that has never downloaded the
+    model — and an env var would silently change behaviour for every other
+    library in the process too.
+    """
     global _encoder
     if _encoder is None:
-        _encoder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+        try:
+            _encoder = SentenceTransformer(EMBED_MODEL_NAME, local_files_only=True)
+        except Exception:
+            _encoder = SentenceTransformer(EMBED_MODEL_NAME)
     return _encoder
 
 
@@ -113,6 +129,15 @@ def get_collection() -> chromadb.Collection:
 # ChromaDB's own file read-only and never touch the memory store.
 
 CHROMA_SQLITE = CHROMA_DIR / "chroma.sqlite3"
+
+#: Floor for vector hits in `recall`. Trims obvious garbage only. It is NOT a
+#: relevance gate and must never be turned into one: measured on the live
+#: store, an unrelated fact scored 0.584 against a query whose true causal
+#: answer scored 0.462, so no single global cutoff separates signal from noise
+#: ACROSS kinds. Per-kind top-N is what does the real work; this only stops the
+#: tail of pure noise from being rendered. (Defined here rather than beside the
+#: rest of the vector code because `recall` takes it as a default argument.)
+VECTOR_MIN_SCORE = 0.35
 
 
 def _chroma_api_disabled() -> bool:
@@ -1094,7 +1119,9 @@ def delete_doc(folder: str, name: str) -> str:
 
 
 @mcp.tool()
-def recall(query: str, n_results: int = 5) -> str:
+def recall(
+    query: str, n_results: int = 5, min_score: float = VECTOR_MIN_SCORE
+) -> str:
     """Search every memory layer at once. Call this FIRST to find anything
     from past sessions. It searches:
     1. Facts (SQLite) — substring match on keys and values
@@ -1114,6 +1141,9 @@ def recall(query: str, n_results: int = 5) -> str:
     """
     n_results = max(1, min(10, n_results))
     sections = []
+    # Keys already rendered by the literal matchers, so the vector top-up can
+    # skip them rather than printing a record twice under two regimes.
+    shown: dict[str, set[str]] = {k: set() for k in db.EMBEDDING_KINDS}
     query_lower = query.lower()
     query_cf = query.casefold()
 
@@ -1194,6 +1224,7 @@ def recall(query: str, n_results: int = 5) -> str:
                         continue
                     fresh["last_reinforced_at"] = datetime.now().isoformat()
                     db.fact_set(c["key"], fresh, conn=txn)
+            shown["fact"].update(c["key"] for c in selected)
             sections.append("Facts:\n" + "\n".join(lines_facts))
     except Exception:
         pass
@@ -1208,6 +1239,7 @@ def recall(query: str, n_results: int = 5) -> str:
                 date = meta.get("date", "unknown") if meta else "unknown"
                 tags = meta.get("tags", "") if meta else ""
                 tag_str = f" [{tags}]" if tags else ""
+                shown["semantic"].add(doc_id)
                 mem_lines.append(
                     f"  [substr] id={doc_id} ({date}){tag_str} (vol: {eff_vol:.1f}) {_preview(doc, 600)}"
                 )
@@ -1233,6 +1265,7 @@ def recall(query: str, n_results: int = 5) -> str:
                         date = meta.get("date", "unknown") if meta else "unknown"
                         tags = meta.get("tags", "") if meta else ""
                         tag_str = f" [{tags}]" if tags else ""
+                        shown["semantic"].add(doc_id)
                         mem_lines.append(
                             f"  [substr] id={doc_id} ({date}){tag_str} (vol: {eff_vol:.1f}) {_preview(doc, 600)}"
                         )
@@ -1274,6 +1307,7 @@ def recall(query: str, n_results: int = 5) -> str:
                             date = meta.get("date", "unknown") if meta else "unknown"
                             tags = meta.get("tags", "") if meta else ""
                             tag_str = f" [{tags}]" if tags else ""
+                            shown["semantic"].add(doc_id)
                             mem_lines.append(
                                 f"  [{score:.2f}] id={doc_id} ({date}){tag_str} (vol: {eff_vol:.1f}) {_preview(doc, 600)}"
                             )
@@ -1298,6 +1332,7 @@ def recall(query: str, n_results: int = 5) -> str:
             if name_match or content_match:
                 preview = content[:200].replace("\n", " ").strip()
                 rel_display = str(rel_path.with_suffix(""))
+                shown["doc"].add(rel_display)
                 doc_matches.append(f"  {rel_display}: {preview}...")
         if doc_matches:
             sections.append("Documents:\n" + "\n".join(doc_matches))
@@ -1342,6 +1377,7 @@ def recall(query: str, n_results: int = 5) -> str:
             ),
             reverse=True,
         )
+        shown["causal"].update(r["id"] for r in causal_cands[:n_results])
         causal_lines = [
             f"  [L{r['layer']} {r['confidence']:.2f}] {r['id']}: "
             f"{_preview(r['text'], 400)}"
@@ -1368,6 +1404,37 @@ def recall(query: str, n_results: int = 5) -> str:
             sections.append("Beliefs:\n" + "\n".join(belief_lines))
     except Exception:
         pass
+
+    # Vector top-up: ONE encode, then one search per kind. Per-kind rather
+    # than global because chunk counts differ by an order of magnitude between
+    # layers (30.2 chunks per document against 1.9 per causal row on the live
+    # store), so a global max-over-chunks would let verbose prose outscore a
+    # precise lesson on a query the lesson answers exactly. `Beliefs:` is left
+    # out on purpose: a subject/predicate/object triple is a slot lookup.
+    # Encode only if there is something to compare against. An empty embeddings
+    # table cannot produce a hit, and the forward pass IS the cost of a search
+    # — on a cold process it also drags in a ~57 s model load — so a store with
+    # no vectors must not pay for a feature it is not using.
+    try:
+        has_vectors = bool(_get_vector_cache()["rows"])
+    except Exception:
+        has_vectors = False
+
+    if has_vectors:
+        try:
+            query_vector = embed_query(query)
+            for title, kind in (
+                ("Facts", "fact"),
+                ("Semantic memories", "semantic"),
+                ("Documents", "doc"),
+                ("Causal memories", "causal"),
+            ):
+                _vector_topup(
+                    sections, title, kind, query_vector,
+                    shown[kind], n_results, min_score,
+                )
+        except Exception:
+            pass
 
     if not sections:
         return f"Nothing found across all memory layers for: {query}"
@@ -1995,6 +2062,282 @@ def causal_list(layer: int = -1, session_id: str = "", limit: int = 50) -> str:
 # ===================================================================
 # QUERY_SOCKET is configured at the top of this module from
 # OPENCODE_MEMORY_SOCKET with a /tmp fallback.
+
+# ---------------------------------------------------------------------------
+# Vector retrieval (Stage A) — chunked embeddings over the whole store
+# ---------------------------------------------------------------------------
+
+EMBED_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+
+#: Encoder context is 128 tokens. A window of 120 leaves room for the two
+#: special tokens the tokenizer adds back when the chunk is encoded, so a chunk
+#: never silently loses its tail to truncation.
+CHUNK_TOKENS = 120
+#: ~27% overlap. A rule split across a boundary has to survive INTACT in at
+#: least one chunk; measured Russian lessons state the rule in one sentence of
+#: roughly 20-30 tokens, so 32 covers it.
+CHUNK_OVERLAP_TOKENS = 32
+
+_vector_cache: dict | None = None
+_vector_lock = threading.Lock()
+
+
+class _OffsetTokenizer(Protocol):
+    """The one HuggingFace fast-tokenizer call the chunker needs."""
+
+    def __call__(
+        self,
+        text: str,
+        add_special_tokens: bool = False,
+        return_offsets_mapping: bool = True,
+    ) -> dict: ...
+
+
+def _chunk_spans(
+    offsets: list[tuple[int, int]], window: int, stride: int
+) -> list[tuple[int, int]]:
+    """Sliding character spans over a token offset mapping. Pure."""
+    n = len(offsets)
+    if n == 0:
+        return []
+    spans: list[tuple[int, int]] = []
+    start = 0
+    while start < n:
+        end = min(start + window, n)
+        spans.append((offsets[start][0], offsets[end - 1][1]))
+        if end == n:
+            break
+        start += stride
+    return spans
+
+
+def _chunk_by_tokens(
+    text: str, tokenizer: _OffsetTokenizer | None = None
+) -> list[str]:
+    """Split text into overlapping windows of at most ``CHUNK_TOKENS`` tokens.
+
+    By TOKENS, not characters. Russian tokenizes to far more tokens per
+    character than English, so a character window sized on English silently
+    truncates Russian — the same shape of bug as SQLite's ASCII-only ``lower()``.
+    Measured on this store: the encoder's 128-token context is about 363
+    characters of Russian, the average fact is 2697 characters and the longest
+    is 9575, so a single vector per record would embed 4% of the longest one.
+
+    The tokenizer is injectable so the algorithm can be tested without loading
+    the model; by default it is the warm encoder's own.
+    """
+    if not text:
+        return []
+    tok = tokenizer if tokenizer is not None else get_encoder().tokenizer
+    encoded = tok(text, add_special_tokens=False, return_offsets_mapping=True)
+    offsets = [tuple(o) for o in encoded["offset_mapping"]]
+    stride = max(1, CHUNK_TOKENS - CHUNK_OVERLAP_TOKENS)
+    return [text[a:b] for a, b in _chunk_spans(offsets, CHUNK_TOKENS, stride)]
+
+
+def embed_chunks(text: str) -> list[bytes]:
+    """Chunk, encode and normalize — the bytes ``db.embedding_upsert`` stores.
+
+    Uses the warm singleton encoder. Nothing in this project may construct a
+    second ``SentenceTransformer``: the hook budget assumes exactly one live
+    model, inside this process.
+    """
+    chunks = _chunk_by_tokens(text)
+    if not chunks:
+        return []
+    matrix = get_encoder().encode(
+        chunks, show_progress_bar=False, normalize_embeddings=True
+    )
+    return [np.asarray(v, dtype="<f4").tobytes() for v in matrix]
+
+
+def _invalidate_vector_cache() -> None:
+    global _vector_cache
+    with _vector_lock:
+        _vector_cache = None
+
+
+def _get_vector_cache() -> dict:
+    global _vector_cache
+    with _vector_lock:
+        if _vector_cache is None:
+            rows, matrix = db.embedding_load(model=EMBED_MODEL_NAME)
+            _vector_cache = {"rows": rows, "matrix": matrix}
+        return _vector_cache
+
+
+def embed_query(query: str) -> np.ndarray:
+    """Normalized query vector from the warm singleton encoder.
+
+    Split out so one `recall` can encode ONCE and reuse the vector across every
+    per-kind search: the forward pass is ~95% of a search's cost (12.6 ms of
+    which 0.6 ms is the matmul, on a 30k-chunk matrix), so encoding per section
+    would quadruple the price of the whole call for nothing.
+    """
+    q = np.asarray(get_encoder().encode(query), dtype=np.float32)
+    norm = float(np.linalg.norm(q))
+    return q / norm if norm > 0 else q
+
+
+def vector_search(
+    query: str | None = None,
+    kind: str | None = None,
+    n_results: int = 10,
+    min_score: float = 0.0,
+    query_vector: np.ndarray | None = None,
+) -> list[tuple[str, str, float]]:
+    """Nearest chunks to ``query``, collapsed to one hit per record.
+
+    Returns ``(kind, key, score)`` sorted by descending cosine. Every stored
+    vector is already unit length, so the whole search is one ``matrix @ q``;
+    at this store's scale (~20k chunks, ~30 MB) an exact brute-force matmul
+    beats any ANN index and needs no index to maintain.
+
+    Scores are the MAX over a record's chunks, never the mean. A 9575-character
+    fact whose single relevant chunk is the entire point would be averaged into
+    the noise by its six irrelevant ones.
+
+    Rows embedded by a different model are excluded at load time: two models
+    share no vector space, and mixing them returns confident nonsense rather
+    than an error.
+
+    CACHE: the matrix is held in-process and rebuilt only when
+    ``_invalidate_vector_cache()`` is called, which every writer of the
+    ``embeddings`` table must do after committing. Nothing here notices a
+    write made by another process.
+    """
+    cache = _get_vector_cache()
+    rows, matrix = cache["rows"], cache["matrix"]
+    if not rows:
+        return []
+
+    if query_vector is None:
+        if query is None:
+            raise ValueError("vector_search needs either query or query_vector")
+        query_vector = embed_query(query)
+
+    scores = matrix @ query_vector
+
+    best: dict[tuple[str, str], float] = {}
+    for row, score in zip(rows, scores, strict=True):
+        if kind is not None and row["kind"] != kind:
+            continue
+        ident = (row["kind"], row["key"])
+        value = float(score)
+        if value > best.get(ident, -2.0):
+            best[ident] = value
+
+    hits = [
+        (k, key, score)
+        for (k, key), score in best.items()
+        if score >= min_score
+    ]
+    hits.sort(key=lambda h: (-h[2], h[0], h[1]))
+    return hits[:n_results]
+
+
+def _semantic_document(doc_id: str) -> str | None:
+    """Text of one semantic memory, from the fallback table or Chroma's file.
+
+    The two stores are DISJOINT: Chroma holds what was written before safe-mode
+    and `semantic_fallback` everything written since. Either can be the only
+    home of a given id, so both are consulted. Chroma is read through read-only
+    sqlite3, never its API.
+    """
+    row = db.semantic_get(doc_id)
+    if row and row.get("text"):
+        return row["text"]
+    conn = _sqlite_ro_conn()
+    if conn is None:
+        return None
+    try:
+        cur = conn.execute(
+            "SELECT string_value FROM embedding_metadata "
+            "WHERE id = ? AND key = 'chroma:document'",
+            (doc_id,),
+        )
+        hit = cur.fetchone()
+        return hit[0] if hit else None
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
+def _render_vector_line(kind: str, key: str, score: float) -> str | None:
+    """One result line, marked so the retrieval regime that found it is visible.
+
+    The existing `[substr]` prefix is what made this whole class of defect
+    diagnosable; blending vector hits into the same undifferentiated list would
+    throw that away.
+    """
+    tag = f"  [vec {score:.2f}]"
+    if kind == "fact":
+        row = db.fact_get(key)
+        return f"{tag} {key}: {_preview(row.get('value', ''), 400, key)}" if row else None
+    if kind == "causal":
+        row = db.causal_get(key)
+        if not row:
+            return None
+        return (
+            f"{tag} [L{row['layer']} {row['confidence']:.2f}] {key}: "
+            f"{_preview(row['text'], 400)}"
+        )
+    if kind == "doc":
+        path = NOTES_DIR / f"{key}.md"
+        if not path.exists():
+            return None
+        return f"{tag} {key}: {_preview(path.read_text(encoding='utf-8'), 200)}"
+    if kind == "semantic":
+        text = _semantic_document(key)
+        return f"{tag} id={key} {_preview(text, 600)}" if text else None
+    return None
+
+
+def _extend_section(sections: list[str], title: str, extra: list[str]) -> None:
+    """Append lines to an existing section, or start one if it is absent."""
+    if not extra:
+        return
+    header = f"{title}:\n"
+    for i, section in enumerate(sections):
+        if section.startswith(header):
+            sections[i] = section + "\n" + "\n".join(extra)
+            return
+    sections.append(header + "\n".join(extra))
+
+
+def _vector_topup(
+    sections: list[str],
+    title: str,
+    kind: str,
+    query_vector: np.ndarray,
+    shown: set[str],
+    n_results: int,
+    min_score: float,
+) -> None:
+    """Add vector hits for one kind, skipping whatever the section already shows.
+
+    Appended AFTER the existing lines and never merged into their ordering, so
+    an exact or substring hit cannot be pushed out by a vector one.
+    """
+    extra: list[str] = []
+    for _kind, key, score in vector_search(
+        kind=kind,
+        n_results=n_results * 4,
+        min_score=min_score,
+        query_vector=query_vector,
+    ):
+        if key in shown:
+            continue
+        line = _render_vector_line(kind, key, score)
+        if line is None:
+            continue
+        extra.append(line)
+        shown.add(key)
+        if len(extra) >= n_results:
+            break
+    _extend_section(sections, title, extra)
+
 
 _fact_embed_cache: dict | None = None
 _fact_embed_lock = threading.Lock()
