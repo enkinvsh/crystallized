@@ -225,6 +225,22 @@ _db_lock = threading.RLock()
 _txn_depth = 0
 
 
+def _py_lower(value: str | None) -> str | None:
+    return value.lower() if value is not None else None
+
+
+def _register_functions(conn: sqlite3.Connection) -> None:
+    """Expose Python's Unicode-aware ``str.lower`` to SQL as ``py_lower``.
+
+    SQLite's built-in ``lower()`` folds ASCII and nothing else, so
+    ``lower(txt) LIKE lower('%гипотеза%')`` does not match a row storing
+    "ГИПОТЕЗА" while the same expression matches "HYPOTHESIS" perfectly --
+    silently, and only for the alphabet this store mostly speaks. Registered
+    here rather than per query because every caller shares this connection.
+    """
+    conn.create_function("py_lower", 1, _py_lower, deterministic=True)
+
+
 def get_db() -> sqlite3.Connection:
     """Return the process-wide SQLite connection, opening it if needed."""
     global _db
@@ -241,6 +257,7 @@ def get_db() -> sqlite3.Connection:
             c.execute("PRAGMA journal_mode=WAL")
             c.execute("PRAGMA synchronous=NORMAL")
             c.execute("PRAGMA busy_timeout=5000")
+            _register_functions(c)
             _db = c
             _init_schema_on(c)
         return _db
@@ -732,6 +749,82 @@ def causal_query(
         rows = c.execute(
             f"SELECT * FROM causal_memories {where_sql} ORDER BY observed_at DESC LIMIT ?",
             tuple(params),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _like_escape(value: str) -> str:
+    """Neutralise LIKE metacharacters so a query is matched literally.
+
+    Paired with ``ESCAPE '\\'`` at every call site: without it a query like
+    ``test_runner`` silently also matches ``testXrunner``.
+    """
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def causal_all(limit: int = 2000) -> list[dict]:
+    """Every causal row worth searching, for callers that match in Python.
+
+    The mirror of :func:`fact_all`, and for the same reason: ``recall`` matches
+    on token overlap as well as substring, and that tokenizer lives in
+    ``server`` -- importing it here would point the store at its own consumer.
+    So the store hands over rows and the caller decides what a match is, which
+    is the split the facts layer has always used.
+
+    Telemetry is excluded HERE rather than by each caller, so the encoding of
+    ``tags`` stays known to exactly one function no matter who reads the layer.
+
+    Ordered by confidence so that if ``limit`` ever truncates, it truncates the
+    machine residue rather than the hand-written lessons.
+    """
+    telemetry, tag_params = telemetry_tag_predicate(match=False)
+    with read_conn() as c:
+        rows = c.execute(
+            f"""
+            SELECT * FROM causal_memories
+            WHERE {telemetry}
+            ORDER BY confidence DESC, observed_at DESC
+            LIMIT ?
+            """,
+            (*tag_params, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def causal_search(query: str, limit: int = 50) -> list[dict]:
+    """Text search over the causal layer: ``text``, ``cause``, ``effect``, ``id``.
+
+    ``causal_query`` filters by layer and session only, so until this existed
+    nothing in the system could find a lesson by what it SAYS -- which is why
+    ``recall`` never searched here and the layer was write-only in practice.
+
+    ``id`` is searched deliberately. Hand-authored rows carry descriptive ids
+    like ``2026-08-23-unmeasured-risk-stated-as-fact``; that is the same search
+    surface a fact key is, and skipping it loses the most deliberate rows first.
+
+    Telemetry is excluded through the shared predicate. Those rows record that
+    the agent ran, not what it learned; they are trigger fuel and must never
+    occupy a retrieval slot.
+
+    Ordered by confidence, which is the honest ranking signal here: hand-written
+    lessons sit at 0.9 and machine-folded rows at 0.27-0.31, so deliberate
+    knowledge floats above automatic residue with no special case for either.
+    """
+    needle = f"%{_like_escape(query.lower())}%"
+    telemetry, tag_params = telemetry_tag_predicate(match=False)
+    with read_conn() as c:
+        rows = c.execute(
+            f"""
+            SELECT * FROM causal_memories
+            WHERE (   py_lower(text)                 LIKE ? ESCAPE '\\'
+                   OR py_lower(COALESCE(cause, ''))  LIKE ? ESCAPE '\\'
+                   OR py_lower(COALESCE(effect, '')) LIKE ? ESCAPE '\\'
+                   OR py_lower(id)                   LIKE ? ESCAPE '\\')
+              AND {telemetry}
+            ORDER BY confidence DESC, observed_at DESC
+            LIMIT ?
+            """,
+            (needle, needle, needle, needle, *tag_params, limit),
         ).fetchall()
     return [dict(r) for r in rows]
 

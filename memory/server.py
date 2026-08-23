@@ -1095,12 +1095,18 @@ def delete_doc(folder: str, name: str) -> str:
 
 @mcp.tool()
 def recall(query: str, n_results: int = 5) -> str:
-    """Search ALL memory layers at once — facts, semantic memories, and documents.
-    This is the recommended first tool to call when you need to find anything
+    """Search every memory layer at once. Call this FIRST to find anything
     from past sessions. It searches:
     1. Facts (SQLite) — substring match on keys and values
     2. Semantic memories (ChromaDB) — meaning-based vector search
     3. Documents (filesystem) — filename and content substring match
+    4. Causal memories (SQLite) — lessons and episodes, matched on text,
+       cause, effect and id; loudest confidence first
+    5. Beliefs (SQLite) — currently ACTIVE beliefs only; superseded ones
+       are history and are not returned
+
+    Operational telemetry (session summaries, tool errors) is deliberately
+    excluded from layer 4: it records that the agent ran, not what it learned.
 
     Args:
         query: What you're looking for (natural language or keyword)
@@ -1295,6 +1301,71 @@ def recall(query: str, n_results: int = 5) -> str:
                 doc_matches.append(f"  {rel_display}: {preview}...")
         if doc_matches:
             sections.append("Documents:\n" + "\n".join(doc_matches))
+    except Exception:
+        pass
+
+    try:
+        # Same rule as the facts block: contiguous substring OR enough token
+        # overlap. Substring alone missed «ГИПОТЕЗА НЕ ИЗМЕРЕНО риск» against a
+        # row storing «ГИПОТЕЗА, НЕ ИЗМЕРЕНО:» — every token present, contiguity
+        # broken by one comma and one colon. Matching happens here, in ONE pass
+        # over rows the store already filtered, so there is a single ranking
+        # regime and nothing to deduplicate.
+        c_tokens = _tokenize_query(query)
+        c_threshold = _overlap_threshold(c_tokens)
+        causal_cands: list[dict] = []
+        for r in db.causal_all():
+            blob = f"{r['id']} {r['text']} {r['cause'] or ''} {r['effect'] or ''}"
+            sub = query_cf in blob.casefold()
+            overlap = (
+                _token_overlap_count(c_tokens, _normalize_for_match(blob))
+                if c_tokens
+                else 0
+            )
+            if not (sub or (c_tokens and overlap >= c_threshold)):
+                continue
+            r["_exact"] = r["id"].casefold() == query_cf
+            r["_sub"] = sub
+            r["_overlap"] = overlap
+            causal_cands.append(r)
+
+        # Confidence leads: a 0.90 hand-written lesson must outrank a 0.27
+        # machine-folded row however many tokens the residue happens to share.
+        causal_cands.sort(
+            key=lambda r: (
+                r["confidence"],
+                1 if r["_exact"] else 0,
+                1 if r["_sub"] else 0,
+                r["_overlap"],
+                r["observed_at"],
+                r["id"],
+            ),
+            reverse=True,
+        )
+        causal_lines = [
+            f"  [L{r['layer']} {r['confidence']:.2f}] {r['id']}: "
+            f"{_preview(r['text'], 400)}"
+            for r in causal_cands[:n_results]
+        ]
+        if causal_lines:
+            sections.append("Causal memories:\n" + "\n".join(causal_lines))
+    except Exception:
+        pass
+
+    try:
+        belief_lines = []
+        for b in db.belief_all_active():
+            haystack = f"{b['subject']} {b['predicate']} {b['object']}"
+            if query_cf not in haystack.casefold():
+                continue
+            belief_lines.append(
+                f"  {b['subject']} -[{b['predicate']}]-> {b['object']} "
+                f"(conf: {b['confidence']:.2f}, src: {b['source']})"
+            )
+            if len(belief_lines) >= n_results:
+                break
+        if belief_lines:
+            sections.append("Beliefs:\n" + "\n".join(belief_lines))
     except Exception:
         pass
 

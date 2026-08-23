@@ -362,3 +362,105 @@ class TestMigration4:
         db.set_db_path(tmp_path / "fresh.sqlite")
         assert _user_version() == 4
         assert db.fact_count() == 0
+
+
+# ---------------------------------------------------------------------------
+# causal_search — the causal layer had no text search at all until now
+# ---------------------------------------------------------------------------
+
+
+class TestCausalSearch:
+    """Text search over the causal layer.
+
+    `causal_query` filters by layer and session only, so nothing in the system
+    could find a lesson by what it SAYS. `recall` never touched this table, and
+    the layer was write-only in practice.
+    """
+
+    @staticmethod
+    def _seed() -> None:
+        db.causal_insert(
+            id="2026-08-23-unmeasured-risk-stated-as-fact",
+            text="ГИПОТЕЗА, НЕ ИЗМЕРЕНО: помечай риск, если он не проверен",
+            cause="догадка выдана за факт",
+            effect="потерянное доверие",
+            confidence=0.9,
+            tags="lesson,hand-written",
+        )
+        db.causal_insert(
+            id="folded-1",
+            text="машинная свёртка про риск",
+            confidence=0.27,
+            tags="observer,session-end,friction",
+        )
+        db.causal_insert(
+            id="tel-1",
+            text="tool `Bash` reported an error: помечай риск",
+            confidence=0.3,
+            tags="observer,post-tool,tool-error,tool:Bash",
+        )
+        db.causal_insert(
+            id="tel-2",
+            text="session s1 ended: риск",
+            confidence=0.3,
+            tags="observer,session-end,session-summary",
+        )
+
+    def test_finds_a_row_by_a_word_in_its_text(self):
+        self._seed()
+        assert "2026-08-23-unmeasured-risk-stated-as-fact" in {
+            r["id"] for r in db.causal_search("помечай")
+        }
+
+    def test_finds_a_row_by_a_word_in_its_cause(self):
+        self._seed()
+        assert [r["id"] for r in db.causal_search("догадка")] == [
+            "2026-08-23-unmeasured-risk-stated-as-fact"
+        ]
+
+    def test_finds_a_row_by_a_word_in_its_effect(self):
+        self._seed()
+        assert [r["id"] for r in db.causal_search("доверие")] == [
+            "2026-08-23-unmeasured-risk-stated-as-fact"
+        ]
+
+    def test_finds_a_row_by_a_fragment_of_its_id(self):
+        """Hand-authored ids are descriptive; they are a search surface."""
+        self._seed()
+        assert [r["id"] for r in db.causal_search("unmeasured-risk")] == [
+            "2026-08-23-unmeasured-risk-stated-as-fact"
+        ]
+
+    def test_cyrillic_is_matched_case_insensitively(self):
+        """LIKE folds ASCII only, and this store is predominantly Russian."""
+        self._seed()
+        assert [r["id"] for r in db.causal_search("гипотеза")] == [
+            "2026-08-23-unmeasured-risk-stated-as-fact"
+        ]
+        assert [r["id"] for r in db.causal_search("ГиПоТеЗа")] == [
+            "2026-08-23-unmeasured-risk-stated-as-fact"
+        ]
+
+    def test_telemetry_never_occupies_a_retrieval_slot(self):
+        """Their text matches; they still must not surface."""
+        self._seed()
+        found = {r["id"] for r in db.causal_search("риск")}
+        assert "tel-1" not in found and "tel-2" not in found
+        assert found == {"2026-08-23-unmeasured-risk-stated-as-fact", "folded-1"}
+
+    def test_deliberate_knowledge_outranks_machine_residue(self):
+        """Confidence is the honest signal: 0.9 hand-written vs 0.27 folded."""
+        self._seed()
+        assert [r["id"] for r in db.causal_search("риск")] == [
+            "2026-08-23-unmeasured-risk-stated-as-fact",
+            "folded-1",
+        ]
+
+    def test_a_query_matching_nothing_returns_nothing(self):
+        self._seed()
+        assert db.causal_search("совершенно посторонний запрос") == []
+
+    def test_the_limit_is_honoured(self):
+        for i in range(10):
+            db.causal_insert(id=f"r{i}", text="повторяющийся текст", confidence=0.5)
+        assert len(db.causal_search("повторяющийся", limit=3)) == 3
