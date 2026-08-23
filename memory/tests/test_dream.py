@@ -26,6 +26,7 @@ if str(MEMORY_DIR) not in sys.path:
 
 import db  # noqa: E402
 import dream  # noqa: E402
+import observer  # noqa: E402
 import volume  # noqa: E402
 
 
@@ -506,6 +507,161 @@ class TestPass1Ingest:
         assert _row("m1")["cause"] is None
 
 
+class TestTelemetryIsNotExperience:
+    """The observer's heartbeat is excluded from consolidation, in SQL.
+
+    Of 394 L0 rows in the live store, 371 are two tag classes the observer emits
+    unconditionally: ``session-summary`` (263, one per session end) and
+    ``tool-error`` (108, one per failing Bash). They record that the agent is
+    running, not that anything was learned — every L1 episode in that store
+    reads "tool `Bash` reported an error: <traceback>" or "session X ended: N
+    user messages".
+
+    Nothing ever claims these rows, so they keep ``parent_id IS NULL``
+    permanently. Selecting them and dropping them in Python would let 371
+    undying rows consume the ``LIMIT`` window on every run — the same starvation
+    ``SINGLETON_EPISODE_AFTER_DAYS`` was added to cure, with no rescue available
+    because a telemetry row is never promoted. The filter therefore has to be a
+    WHERE clause, and the tests below pin that distinction.
+    """
+
+    @staticmethod
+    def _seed_telemetry(count: int = 1, *, days_ago: float = SETTLED_DAYS_AGO) -> None:
+        for i in range(count):
+            _add_l0(
+                f"tool-err-{i}",
+                f"tool `Bash` reported an error: boom {i}",
+                session=f"telemetry-{i}",
+                days_ago=days_ago,
+                cause="tool_call:Bash",
+                effect="tool_error",
+                tags="observer,post-tool,tool-error,tool:Bash",
+            )
+            _add_l0(
+                f"summary-{i}",
+                f"session s{i} ended: 3 user messages",
+                session=f"telemetry-{i}",
+                days_ago=days_ago,
+                cause="session_end",
+                effect="session_summary",
+                tags="observer,session-end,session-summary",
+            )
+
+    def test_unprocessed_l0_skips_telemetry_and_keeps_real_rows(self, temp_db):
+        self._seed_telemetry()
+        _add_l0("real", "build failed because the lockfile was stale",
+                tags="observer,session-end,friction")
+
+        assert [r["id"] for r in dream._unprocessed_l0(100)] == ["real"]
+
+    def test_telemetry_does_not_eat_the_ingest_budget(self, temp_db):
+        """Excluded in SQL, not in Python: 50 undying rows must not own the LIMIT.
+
+        Telemetry is seeded OLDER than the real rows, so ``ORDER BY observed_at
+        ASC LIMIT 2`` hands it the entire window if the filter runs after the
+        query — and it does so again on every subsequent run, forever.
+        """
+        self._seed_telemetry(25, days_ago=10)
+        _add_l0("real1", "x", session="pair", days_ago=1)
+        _add_l0("real2", "y", session="pair", days_ago=1)
+
+        rows = dream._unprocessed_l0(2)
+
+        assert {r["id"] for r in rows} == {"real1", "real2"}
+
+    def test_a_longer_tag_is_not_a_telemetry_tag(self, temp_db):
+        """``tags`` is a comma-joined string, so the match must be delimited."""
+        _add_l0("recovered", "the retry succeeded",
+                tags="observer,post-tool,tool-error-recovered")
+
+        assert [r["id"] for r in dream._unprocessed_l0(100)] == ["recovered"]
+
+    def test_newest_l0_ignores_a_heartbeat(self, temp_db):
+        """"Quiet" has to mean no signal arrived, not that the agent stopped
+        breathing: a session end bumps this clock every time the user works."""
+        _add_l0("real", "x", days_ago=2)
+        self._seed_telemetry(days_ago=0.0)
+
+        assert dream.newest_l0() == datetime.fromisoformat(_row("real")["observed_at"])
+
+    def test_should_run_is_not_held_off_by_telemetry(self, temp_db):
+        """The starved trigger: a live agent used to postpone every poll."""
+        dream.write_last_success(datetime.now(UTC) - timedelta(hours=25))
+        _add_l0("real", "x", days_ago=2)
+        self._seed_telemetry(days_ago=0.0)
+
+        go, why = dream.should_run()
+
+        assert go
+        assert why.endswith("m quiet")
+        assert not why.startswith("only")  # the skip path's phrasing
+
+    def test_friction_is_experience_and_still_consolidates(self, temp_db):
+        """Anti-overreach: only telemetry is excluded, never friction.
+
+        Friction rows carry no cause either — the agent's side of the exchange
+        is not written to the transcript at all, so what provoked the rejection
+        is unobserved — but they ARE lived experience and must still reach an
+        episode. This fails if someone "fixes" the fabricated
+        ``user_message -> hard_rejection`` pair by excluding friction the way
+        telemetry is excluded.
+        """
+        self._seed_telemetry()
+        _add_l0("f1", "user negative_constraint: не трогай", session="live",
+                effect="negative_constraint",
+                tags="observer,session-end,friction,negative_constraint")
+        _add_l0("f2", "user hard_rejection: нет", session="live",
+                effect="hard_rejection",
+                tags="observer,session-end,friction,hard_rejection")
+
+        stats = dream.consolidate()
+
+        assert stats["pass1_ingest"]["scanned"] == 2
+        assert stats["pass2_compress"]["l1"] == 1
+        assert _row("f1")["parent_id"] is not None
+
+    def test_a_lone_friction_row_becomes_an_episode_but_not_a_belief(self, temp_db, tmp_path):
+        """The live case, end to end from a transcript: 5 of 8 sessions held
+        exactly one friction row.
+
+        Each used to inherit ``user_message -> <type>`` unanimously — unanimity
+        being trivial at n=1 — and Pass 3 asserted it. With the cause gone the
+        episode is still built; there is simply nothing in it that projects onto
+        a belief. Driven through ``observer`` rather than a hand-seeded row, so
+        it measures what the hook actually writes.
+        """
+        transcript = tmp_path / "ses_fd258c66a.jsonl"
+        transcript.write_text(json.dumps({
+            "type": "user",
+            "timestamp": _iso(days_ago=30),
+            "message": {"role": "user", "content": "не трогай этот файл"},
+        }), "utf-8")
+        observer.record(
+            observer.session_end_observations({"session_id": "ses_fd258c66a"}, transcript)
+        )
+
+        # Past the singleton wait, so the episode is minted; past the default
+        # TTL too, so Pass 5 would reap the row it just parented — a longer TTL
+        # keeps it readable without touching DEFAULT_L0_TTL_DAYS.
+        stats = dream.consolidate(l0_ttl_days=90)
+
+        assert stats["pass1_ingest"]["scanned"] == 1  # the summary row is telemetry
+        assert stats["pass2_compress"]["l1"] == 1
+        assert stats["pass3_reconcile"]["asserted"] == 0
+        assert db.belief_all_active() == []
+
+    def test_a_telemetry_only_store_consolidates_into_nothing(self, temp_db):
+        """No episode, and therefore no fabricated belief to promote."""
+        self._seed_telemetry(3, days_ago=30)
+
+        stats = dream.consolidate()
+
+        assert stats["pass1_ingest"]["scanned"] == 0
+        assert stats["pass2_compress"]["l1"] == 0
+        assert stats["pass3_reconcile"]["asserted"] == 0
+        assert db.belief_all_active() == []
+
+
 # ===========================================================================
 # Pass 2 — lossy compression
 # ===========================================================================
@@ -952,6 +1108,84 @@ class TestPass5Forget:
         self._seed()
         assert dream.pass5_forget(l0_ttl_days=7, dry_run=True) == 1
         assert _row("old_parented") is not None
+
+
+class TestPass5ReapsTelemetry:
+    """Telemetry ages out on the TTL alone, because it can never earn a parent.
+
+    Excluding it from consolidation removed the only route by which it used to
+    disappear: it was folded into a junk episode, which set ``parent_id``, which
+    let the reaper take it at 7 days. Nothing claims it now, so a reaper that
+    demands a parent would make it immortal — roughly 90 rows a day, forever.
+    The parent check still guards REAL observations, whose content has to
+    survive inside an episode before the trace may go.
+    """
+
+    @staticmethod
+    def _seed_every_case() -> None:
+        """One row per branch of the predicate, so the four cases are separable."""
+        db.causal_insert(id="parent", text="episode", layer=1)
+        _add_l0("aged_parented_real", "consumed", days_ago=30)
+        _add_l0("aged_orphan_real", "nothing summarizes this yet", days_ago=30)
+        _add_l0("aged_telemetry", "session s ended: 3 user messages", days_ago=30,
+                tags="observer,session-end,session-summary")
+        _add_l0("fresh_telemetry", "tool `Bash` reported an error: boom", days_ago=0,
+                tags="observer,post-tool,tool-error,tool:Bash")
+        with db.write_txn() as txn:
+            txn.execute(
+                "UPDATE causal_memories SET parent_id='parent' "
+                "WHERE id = 'aged_parented_real'"
+            )
+
+    def test_reaps_aged_telemetry_that_nothing_will_ever_claim(self, temp_db):
+        _add_l0("aged_telemetry", "session s ended: 3 user messages", days_ago=30,
+                tags="observer,session-end,session-summary")
+        assert dream.pass5_forget(l0_ttl_days=7) == 1
+        assert _row("aged_telemetry") is None
+
+    def test_telemetry_inside_the_ttl_is_left_alone(self, temp_db):
+        _add_l0("fresh_telemetry", "tool `Bash` reported an error: boom", days_ago=1,
+                tags="observer,post-tool,tool-error,tool:Bash")
+        assert dream.pass5_forget(l0_ttl_days=7) == 0
+        assert _row("fresh_telemetry") is not None
+
+    def test_an_unparented_real_observation_is_still_never_reaped(self, temp_db):
+        """The original safety property. This fails if the predicate is ever
+        'simplified' into a bare TTL sweep."""
+        _add_l0("aged_orphan_real", "the lockfile was stale", days_ago=300)
+        assert dream.pass5_forget(l0_ttl_days=7) == 0
+        assert _row("aged_orphan_real") is not None
+
+    def test_an_aged_parented_real_observation_is_still_reaped(self, temp_db):
+        db.causal_insert(id="parent", text="episode", layer=1)
+        _add_l0("aged_parented_real", "consumed", days_ago=30)
+        with db.write_txn() as txn:
+            txn.execute("UPDATE causal_memories SET parent_id='parent' WHERE id = ?",
+                        ("aged_parented_real",))
+
+        assert db.causal_delete_l0_reapable(l0_ttl_days=7) == 1
+        assert _row("aged_parented_real") is None
+        assert _row("parent") is not None
+
+    def test_a_longer_tag_is_not_reapable_without_a_parent(self, temp_db):
+        """``tool-error-recovered`` is a real observation about a retry."""
+        _add_l0("recovered", "the retry succeeded", days_ago=300,
+                tags="observer,post-tool,tool-error-recovered")
+        assert dream.pass5_forget(l0_ttl_days=7) == 0
+        assert _row("recovered") is not None
+
+    def test_the_dry_run_count_is_exactly_what_the_delete_removes(self, temp_db):
+        """Anti-drift: report and action must read ONE predicate, not two copies."""
+        self._seed_every_case()
+
+        predicted = dream.pass5_forget(l0_ttl_days=7, dry_run=True)
+        deleted = dream.pass5_forget(l0_ttl_days=7)
+
+        assert predicted == deleted == 2
+        assert _row("aged_parented_real") is None
+        assert _row("aged_telemetry") is None
+        assert _row("aged_orphan_real") is not None
+        assert _row("fresh_telemetry") is not None
 
 
 # ===========================================================================

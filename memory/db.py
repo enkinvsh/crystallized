@@ -35,6 +35,31 @@ EVENTS_MAXLEN = 100000
 _EVENTS_TRIM_PROBABILITY = 0.001
 _DEFAULT_TTL_DAYS = 60
 
+#: ``causal_memories.tags`` values marking a row as operational telemetry rather
+#: than lived experience. Vocabulary of the table, not behaviour of any one
+#: module: the hook writes these tags and consolidation must not mistake the
+#: rows carrying them for something that was learned. One place to edit.
+TELEMETRY_TAGS: frozenset[str] = frozenset({"session-summary", "tool-error"})
+
+
+def telemetry_tag_predicate(*, match: bool) -> tuple[str, list[str]]:
+    """Boolean SQL expression testing ``causal_memories.tags`` for telemetry.
+
+    The ONLY place that knows ``tags`` is comma-joined and must therefore be
+    compared in its DELIMITED form: a bare ``LIKE '%tool-error%'`` would also
+    catch ``tool-error-recovered``, which is a real observation about a retry
+    that worked. Consolidation excludes these rows and the reaper collects them,
+    so the two must agree on the membership test exactly.
+
+    ``match=True`` yields "carries at least one telemetry tag", ``match=False``
+    its negation. Tag values are bound, never interpolated — they are data.
+    """
+    tags = sorted(TELEMETRY_TAGS)
+    op, joiner = ("LIKE", " OR ") if match else ("NOT LIKE", " AND ")
+    clause = joiner.join(f"',' || COALESCE(tags, '') || ',' {op} ?" for _ in tags)
+    return f"({clause})", [f"%,{tag},%" for tag in tags]
+
+
 # ---------------------------------------------------------------------------
 # Schemas & Migrations
 # ---------------------------------------------------------------------------
@@ -122,10 +147,73 @@ CREATE TABLE IF NOT EXISTS decay_anchor (
   age_hours  REAL NOT NULL DEFAULT 0);
 """
 
+_V4_REPAIR_SQL = r"""
+-- Data repair, not schema: null the causal pairs this project's own observer
+-- fabricated, and drop the beliefs Pass 3 minted out of them.
+--
+-- A tool-error row always said `tool_call:<tool> -> tool_error`; a session
+-- summary always said `session_end -> session_summary`; a friction row always
+-- said `user_message -> <type>`, restating the detector's own precondition.
+-- None of the three was observed -- each is a branch of the hook restated as a
+-- fact -- so an episode built from them agreed unanimously, `_coherent_pair`
+-- passed the tautology up the ladder, and Pass 3 promoted it. Those sites now
+-- write NULL, but Pass 3 reads rows and not source code: every store already
+-- holding the backlog goes on minting the same beliefs forever.
+--
+-- The literals below are deliberately HARDCODED. Do not "DRY this up" against
+-- TELEMETRY_TAGS or any other live constant: a migration is a historical
+-- record of a repair applied at one point in time, and if the tag set gains a
+-- member next year this statement must still describe exactly what it did.
+--
+-- Matched on the PAIR, at EVERY layer, and never on tags. `pass3_reconcile`
+-- selects `layer >= 1`, so a synthesized parent that inherited the tautology
+-- re-mints the belief after the belief row is deleted; and `_promote` gives an
+-- L2 digest `tags = <dominant tag>`, so an inherited pair can sit on a row
+-- whose tags have collapsed to just `observer`. Keying off tags would walk
+-- straight past it -- which is also why nothing here needs the delimited tag
+-- form, and why a `tool-error-recovered` row survives: it never carried one of
+-- these pairs in the first place.
+--
+-- `_` is a LIKE wildcard, hence ESCAPE. Without it `tool\_call\_%` would also
+-- match anything merely SHAPED like `toolXcallY`.
+
+UPDATE causal_memories
+   SET cause = NULL, effect = NULL
+ WHERE cause LIKE 'tool\_call:%' ESCAPE '\'
+   AND effect = 'tool_error';
+
+UPDATE causal_memories
+   SET cause = NULL, effect = NULL
+ WHERE cause = 'session_end'
+   AND effect = 'session_summary';
+
+-- Friction keeps its effect: `hit['type']` is a real classification and is what
+-- observer.py still writes. Only the invented cause goes.
+UPDATE causal_memories
+   SET cause = NULL
+ WHERE cause = 'user_message';
+
+-- Targeted on the triple, never on `source`: a dream-authored belief about
+-- something real must survive. The subject spellings are what `belief_from` ->
+-- `normalize_subject` actually produce -- ':' is outside [\w./-] and folds to
+-- '_', so 'tool_call:Bash' becomes 'tool_call_bash'. The tool name varies, so
+-- that subject is matched by prefix. For the friction shape the object is left
+-- free: the subject 'user_message' can only have come from the one fabricating
+-- site, whichever of the friction types happened to land in the object.
+-- Superseded rows go too; supersession chains never cross a subject boundary,
+-- so no surviving belief is left pointing at a deleted one.
+DELETE FROM belief_state
+ WHERE predicate = 'causes'
+   AND ( (subject LIKE 'tool\_call\_%' ESCAPE '\' AND object = 'tool_error')
+      OR (subject = 'session_end' AND object = 'session_summary')
+      OR (subject = 'user_message') );
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: _V1_SCHEMA_SQL,
     2: _V2_SCHEMA_SQL,
     3: _V3_SCHEMA_SQL,
+    4: _V4_REPAIR_SQL,
 }
 
 # ---------------------------------------------------------------------------
@@ -648,19 +736,36 @@ def causal_query(
     return [dict(r) for r in rows]
 
 
-def causal_delete_l0_with_parent(l0_ttl_days: int = 7) -> int:
-    """Lossy compaction: clean raw L0 memories whose parent L1 exists and is old."""
+def causal_delete_l0_reapable(l0_ttl_days: int = 7, dry_run: bool = False) -> int:
+    """Lossy compaction: drop aged L0 rows that are consumed, or unconsumable.
+
+    The parent check is what makes this compaction rather than data loss: a raw
+    record is only forgotten once its content survives inside an episode.
+
+    Telemetry is exempt from that check because it can never satisfy it. Those
+    rows are excluded from consolidation by design — they record that the agent
+    ran, not what was learned — so nothing ever claims them and their
+    ``parent_id`` stays NULL for good. Demanding a parent would therefore make
+    them immortal, at roughly 90 rows a day. There is no content of theirs to
+    survive; for them the TTL alone is the whole rule.
+
+    ``dry_run`` counts against the SAME predicate instead of deleting, so the
+    number reported and the number removed cannot drift apart.
+    """
+    telemetry, tag_params = telemetry_tag_predicate(match=True)
+    where = f"""
+        WHERE layer = 0
+          AND (parent_id IS NOT NULL OR {telemetry})
+          AND observed_at < datetime('now', '-' || ? || ' days')
+    """
+    params = (*tag_params, l0_ttl_days)
+    if dry_run:
+        with read_conn() as c:
+            return int(
+                c.execute(f"SELECT COUNT(*) FROM causal_memories {where}", params).fetchone()[0]
+            )
     with write_txn() as c:
-        cur = c.execute(
-            """
-            DELETE FROM causal_memories
-            WHERE layer = 0
-              AND parent_id IS NOT NULL
-              AND observed_at < datetime('now', '-' || ? || ' days')
-            """,
-            (l0_ttl_days,),
-        )
-        return cur.rowcount
+        return c.execute(f"DELETE FROM causal_memories {where}", params).rowcount
 
 
 # ---------------------------------------------------------------------------

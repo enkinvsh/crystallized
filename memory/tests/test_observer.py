@@ -518,19 +518,23 @@ class TestPostToolObservations:
         }
         obs = observer.post_tool_observations(payload)
         assert len(obs) == 1
-        assert obs[0].effect == "tool_error"
+        # Telemetry rows are identified by tag, never by cause/effect: they
+        # deliberately state no causal pair, so that an episode made of nothing
+        # else cannot agree one into existence. Restoring `.effect` here would
+        # restore belief:b8991d5e79839166 with it.
+        assert "tool-error" in obs[0].tags
         assert "tool:Bash" in obs[0].tags
 
     def test_nonzero_exit_code_is_an_error(self):
         payload = {"tool_name": "Bash", "tool_response": {"exit_code": 2, "stdout": "nope"}}
-        assert observer.post_tool_observations(payload)[0].effect == "tool_error"
+        assert "tool-error" in observer.post_tool_observations(payload)[0].tags
 
     def test_traceback_text_is_an_error(self):
         payload = {
             "tool_name": "Bash",
             "tool_response": "Traceback (most recent call last):\n  ZeroDivisionError",
         }
-        assert observer.post_tool_observations(payload)[0].effect == "tool_error"
+        assert "tool-error" in observer.post_tool_observations(payload)[0].tags
 
     @pytest.mark.parametrize(
         "output",
@@ -553,7 +557,8 @@ class TestPostToolObservations:
             "tool_response": {"is_error": True, "stderr": "не трогай этот файл"},
         }
         obs = observer.post_tool_observations(payload)
-        assert [o.effect for o in obs] == ["tool_error"]
+        assert len(obs) == 1
+        assert "tool-error" in obs[0].tags
 
     def test_todowrite_output_produces_nothing(self):
         payload = {
@@ -594,11 +599,11 @@ class TestSessionEndObservations:
     def test_summary_always_emitted(self, tmp_path):
         path = _write_transcript(tmp_path, [{"role": "user", "content": "hello"}])
         obs = observer.session_end_observations({"session_id": "s1"}, path)
-        assert obs[-1].effect == "session_summary"
+        assert "session-summary" in obs[-1].tags
 
     def test_summary_emitted_without_transcript(self):
         obs = observer.session_end_observations({"session_id": "s1"}, None)
-        assert len(obs) == 1 and obs[0].effect == "session_summary"
+        assert len(obs) == 1 and "session-summary" in obs[0].tags
 
     def test_user_friction_is_extracted(self, tmp_path):
         path = _write_transcript(tmp_path, [
@@ -610,6 +615,16 @@ class TestSessionEndObservations:
         effects = {o.effect for o in obs}
         assert patterns.NEGATIVE_CONSTRAINT in effects
         assert patterns.FRUSTRATION in effects
+
+    def test_friction_states_its_type_but_never_a_cause(self, tmp_path):
+        """The effect is a classification; the cause was never written down."""
+        path = _write_transcript(tmp_path, [
+            {"role": "user", "content": "не трогай этот файл"},
+        ])
+        obs = observer.session_end_observations({}, path)
+        friction = [o for o in obs if o.effect == patterns.NEGATIVE_CONSTRAINT]
+        assert len(friction) == 1
+        assert friction[0].cause is None
 
     def test_confidence_is_damped_to_l0_range(self, tmp_path):
         path = _write_transcript(tmp_path, [
@@ -656,7 +671,7 @@ class TestSessionEndObservations:
 
     def test_missing_transcript_is_safe(self, tmp_path):
         obs = observer.session_end_observations({}, tmp_path / "nope.jsonl")
-        assert len(obs) == 1 and obs[0].effect == "session_summary"
+        assert len(obs) == 1 and "session-summary" in obs[0].tags
 
     def test_ephemeral_user_message_does_not_create_a_rule(self, tmp_path):
         path = _write_transcript(tmp_path, [
@@ -677,8 +692,50 @@ class TestSessionEndObservations:
             {"role": "user", "content": "не трогай конфиг"},
         ])
         obs = observer.session_end_observations({}, path, observer.Deadline(0.0))
-        assert obs[-1].effect == "session_summary"
+        assert "session-summary" in obs[-1].tags
         assert "truncated" in obs[-1].text
+
+
+class TestTelemetryCarriesNoCausalClaim:
+    """Telemetry rows state no cause/effect, so no belief can be minted from them.
+
+    Both rows are emitted unconditionally — one per failing tool call, one per
+    session end — so an episode built out of them agrees with itself trivially.
+    ``dream._coherent_pair`` inherits a pair when EVERY member states the same
+    one, and Pass 3 then promotes that agreement: ``belief:b8991d5e79839166``
+    ("tool_call_bash causes tool_error", evidence ``l1:ec3384b5c665449b``) and
+    ``belief:950649f22e74f369`` ("session_end causes session_summary") are both
+    live in the store, asserted from a heartbeat. A row that claims nothing
+    cannot be agreed with.
+    """
+
+    def test_a_tool_error_states_no_cause_or_effect(self):
+        payload = {
+            "tool_name": "Bash",
+            "session_id": "s1",
+            "tool_response": {"is_error": True, "stderr": "boom"},
+        }
+        obs = observer.post_tool_observations(payload)
+        assert len(obs) == 1
+        assert obs[0].cause is None and obs[0].effect is None
+
+    def test_a_session_summary_states_no_cause_or_effect(self):
+        obs = observer.session_end_observations({"session_id": "s1"}, None)
+        assert len(obs) == 1
+        assert obs[0].cause is None and obs[0].effect is None
+
+    def test_the_telemetry_tags_are_unchanged(self):
+        """The exclusion in `dream` keys off these tags — they are the contract."""
+        error = observer.post_tool_observations({
+            "tool_name": "Bash",
+            "session_id": "s1",
+            "tool_response": {"is_error": True, "stderr": "boom"},
+        })[0]
+        summary = observer.session_end_observations({"session_id": "s1"}, None)[0]
+
+        assert error.tags == ("observer", "post-tool", "tool-error", "tool:Bash")
+        assert summary.tags == ("observer", "session-end", "session-summary")
+        assert observer.TELEMETRY_TAGS <= set(error.tags) | set(summary.tags)
 
 
 class TestResolveTranscript:
@@ -769,9 +826,9 @@ class TestCliContract:
         path = _write_transcript(tmp_path, [{"role": "user", "content": "не трогай конфиг"}])
         payload = json.dumps({"session_id": "cli2", "transcript_path": str(path)})
         assert observer.main(["--session-end"], stdin_text=payload) == 0
-        effects = {r["effect"] for r in db.causal_query(session_id="cli2")}
-        assert patterns.NEGATIVE_CONSTRAINT in effects
-        assert "session_summary" in effects
+        rows = db.causal_query(session_id="cli2")
+        assert patterns.NEGATIVE_CONSTRAINT in {r["effect"] for r in rows}
+        assert any("session-summary" in r["tags"].split(",") for r in rows)
 
     @pytest.mark.parametrize(
         "argv,stdin",

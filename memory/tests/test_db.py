@@ -202,3 +202,163 @@ def test_belief_assert_survives_a_long_flip_flop_on_one_id():
     assert active["id"] == "b1"
     assert active["object"] == "B"
     assert _belief_count() == 1
+
+
+# ---------------------------------------------------------------------------
+# Migration 4 — repair of the pairs this project's own observer fabricated
+# ---------------------------------------------------------------------------
+
+
+def _user_version() -> int:
+    return int(db.get_db().execute("PRAGMA user_version").fetchone()[0])
+
+
+def _causal(id: str) -> dict:
+    return dict(db.get_db().execute(
+        "SELECT * FROM causal_memories WHERE id = ?", (id,)
+    ).fetchone())
+
+
+def _seed_v3_store(path: Path) -> None:
+    """A database frozen at schema version 3, holding what the old hook wrote.
+
+    Built through a raw connection so ``db`` never sees it before the test asks
+    it to — opening it via ``set_db_path`` is what triggers migration 4.
+    """
+    conn = sqlite3.connect(str(path), isolation_level=None)
+    try:
+        for version in (1, 2, 3):
+            conn.executescript(db.MIGRATIONS[version])
+        conn.execute("PRAGMA user_version = 3")
+
+        rows = [
+            # (id, layer, cause, effect, tags)
+            ("l0_tool_err", 0, "tool_call:Bash", "tool_error",
+             "observer,post-tool,tool-error,tool:Bash"),
+            ("l0_tool_err_other", 0, "tool_call:Read", "tool_error",
+             "observer,post-tool,tool-error,tool:Read"),
+            ("l0_summary", 0, "session_end", "session_summary",
+             "observer,session-end,session-summary"),
+            ("l0_friction", 0, "user_message", "hard_rejection",
+             "observer,session-end,friction,hard_rejection"),
+            # A real pair, hand-written or recovered by pass1. Must survive.
+            ("l0_legit", 0, "the lockfile was stale", "build failed",
+             "observer,session-end,friction"),
+            # Delimiter bait: a real observation about a retry that worked.
+            ("l0_recovered", 0, "the retry succeeded", "build passed",
+             "observer,post-tool,tool-error-recovered"),
+            # The second-order case: a synthesized parent that INHERITED the
+            # tautology. Its tags collapsed to the dominant one, so nothing
+            # keyed on tags would ever reach it.
+            ("l1_inherited", 1, "tool_call:Bash", "tool_error", "observer"),
+            ("l2_inherited", 2, "session_end", "session_summary", "observer"),
+        ]
+        for id_, layer, cause, effect, tags in rows:
+            conn.execute(
+                "INSERT INTO causal_memories "
+                "(id, text, layer, cause, effect, observed_at, recorded_at, tags) "
+                "VALUES (?, ?, ?, ?, ?, '2026-08-01T00:00:00+00:00', "
+                "'2026-08-01T00:00:00+00:00', ?)",
+                (id_, f"text of {id_}", layer, cause, effect, tags),
+            )
+
+        beliefs = [
+            ("b_tool_bash", "tool_call_bash", "causes", "tool_error", "dream"),
+            ("b_tool_read", "tool_call_read", "causes", "tool_error", "dream"),
+            ("b_session", "session_end", "causes", "session_summary", "dream"),
+            ("b_friction", "user_message", "causes", "hard_rejection", "dream"),
+            # A belief a human asserted. Must survive.
+            ("b_user", "user.ui.icon_system", "uses", "lucide", "user"),
+            # A dream belief about something real. `source` is NOT the test.
+            ("b_real", "stale_lock", "causes", "build fails", "dream"),
+        ]
+        for id_, subject, predicate, object_val, source in beliefs:
+            conn.execute(
+                "INSERT INTO belief_state "
+                "(id, subject, predicate, object, valid_from, recorded_at, source) "
+                "VALUES (?, ?, ?, ?, '2026-08-01T00:00:00+00:00', "
+                "'2026-08-01T00:00:00+00:00', ?)",
+                (id_, subject, predicate, object_val, source),
+            )
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def migrated_from_v3(tmp_path):
+    """A v3 store, opened through ``db`` so migration 4 runs against it."""
+    path = tmp_path / "v3.sqlite"
+    _seed_v3_store(path)
+    db.set_db_path(path)
+    yield path
+    db.close_db()
+
+
+class TestMigration4:
+    """Migration 4 nulls the causal pairs the observer used to invent.
+
+    The code fix stops new rows carrying them; it cannot reach the ones already
+    written. Pass 3 reads rows, not source, so a store carrying the backlog goes
+    on minting ``tool_call_bash causes tool_error`` forever. This is a defect
+    this project shipped, so it is repaired where every installation will get
+    it, not in one terminal.
+    """
+
+    def test_fabricated_pairs_are_nulled_and_real_ones_survive(self, migrated_from_v3):
+        assert (_causal("l0_tool_err")["cause"], _causal("l0_tool_err")["effect"]) == (None, None)
+        assert (_causal("l0_summary")["cause"], _causal("l0_summary")["effect"]) == (None, None)
+
+        # Friction keeps its classification; only the invented cause goes.
+        friction = _causal("l0_friction")
+        assert friction["cause"] is None
+        assert friction["effect"] == "hard_rejection"
+
+        legit = _causal("l0_legit")
+        assert (legit["cause"], legit["effect"]) == ("the lockfile was stale", "build failed")
+
+        recovered = _causal("l0_recovered")
+        assert (recovered["cause"], recovered["effect"]) == ("the retry succeeded", "build passed")
+
+    def test_an_inherited_pair_is_nulled_at_every_layer(self, migrated_from_v3):
+        """pass3_reconcile selects ``layer >= 1``, so a synthesized parent that
+        inherited the tautology re-mints the belief after it is deleted."""
+        assert (_causal("l1_inherited")["cause"], _causal("l1_inherited")["effect"]) == (None, None)
+        assert (_causal("l2_inherited")["cause"], _causal("l2_inherited")["effect"]) == (None, None)
+
+    def test_the_parent_rows_themselves_are_kept(self, migrated_from_v3):
+        """Inert, not deleted — a stranger's consolidated history is not ours."""
+        assert _causal("l1_inherited")["text"] == "text of l1_inherited"
+        assert _causal("l2_inherited")["layer"] == 2
+
+    def test_the_fabricated_beliefs_are_deleted(self, migrated_from_v3):
+        for gone in ("tool_call_bash", "tool_call_read", "session_end", "user_message"):
+            assert db.belief_get_active(gone, "causes") is None
+
+    def test_beliefs_that_were_never_fabricated_survive(self, migrated_from_v3):
+        assert db.belief_get_active("user.ui.icon_system", "uses")["object"] == "lucide"
+        assert db.belief_get_active("stale_lock", "causes")["object"] == "build fails"
+        assert _belief_count() == 2
+
+    def test_the_schema_version_is_advanced(self, migrated_from_v3):
+        assert _user_version() == 4
+
+    def test_running_it_again_changes_nothing(self, migrated_from_v3):
+        def snapshot() -> tuple[list, list, int]:
+            conn = db.get_db()
+            return (
+                [tuple(r) for r in conn.execute(
+                    "SELECT * FROM causal_memories ORDER BY id").fetchall()],
+                [tuple(r) for r in conn.execute(
+                    "SELECT * FROM belief_state ORDER BY id").fetchall()],
+                _user_version(),
+            )
+
+        before = snapshot()
+        db.init_schema()
+        db.init_schema()
+        assert snapshot() == before
+
+    def test_a_fresh_database_initialises_straight_to_4(self, tmp_path):
+        db.set_db_path(tmp_path / "fresh.sqlite")
+        assert _user_version() == 4
+        assert db.fact_count() == 0

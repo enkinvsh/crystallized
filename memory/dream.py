@@ -202,16 +202,39 @@ def write_last_success(moment: datetime) -> None:
     os.replace(tmp, path)
 
 
+def _exclude_telemetry() -> tuple[str, list[str]]:
+    """``AND``-prefixed form of the shared predicate, for this module's L0 queries.
+
+    The membership test itself lives in ``db.telemetry_tag_predicate`` because
+    ``pass5_forget`` needs its exact negation to collect what is skipped here.
+    Two spellings of "is this row telemetry" would eventually disagree, and the
+    disagreement is silent: rows either consolidated twice or reaped forever.
+    """
+    clause, params = db.telemetry_tag_predicate(match=False)
+    return f" AND {clause}", params
+
+
 def newest_l0() -> datetime | None:
-    """When the store last took in a raw observation.
+    """When the store last took in a raw observation WORTH WAITING ON.
 
     This is the agent's clock, not the human's: HID idle time would call a long
     unattended task "quiet". ``events`` would be worse still — naive local time
     against this UTC one is a five-hour error, and it is a ring buffer besides.
+
+    Telemetry is excluded because it made this clock measure the wrong thing.
+    A session end bumps it every time the user stops typing and a failing Bash
+    bumps it mid-thought; together they are 371 of the store's 394 L0 rows. So
+    "raw data is still arriving" read as "the agent is alive", every 15-minute
+    poll was talked out of working for as long as anyone was working, and in the
+    last 24h the only pass that landed came in through ``MAX_STALE_HOURS``.
+    Quiet has to mean no signal arrived, not that the agent stopped breathing.
     """
+    clause, params = _exclude_telemetry()
     with db.read_conn() as c:
         row = c.execute(
-            "SELECT MAX(observed_at) AS newest FROM causal_memories WHERE layer = 0"
+            "SELECT MAX(observed_at) AS newest FROM causal_memories "
+            f"WHERE layer = 0{clause}",
+            params,
         ).fetchone()
     return _parse_observed(row["newest"] if row else None)
 
@@ -337,16 +360,27 @@ def normalize_subject(text: str) -> str:
 
 
 def _unprocessed_l0(limit: int) -> list[dict]:
-    """Raw records that no episode has claimed yet (``parent_id IS NULL``)."""
+    """Raw records that no episode has claimed yet (``parent_id IS NULL``).
+
+    Telemetry is excluded IN THE QUERY, never by filtering the returned list.
+    Those rows are never promoted, so nothing ever sets their ``parent_id``:
+    selecting them and discarding them afterwards would hand 371 rows the oldest
+    end of every ``LIMIT``-sized window for the whole of their TTL, on every
+    single run. That is the starvation ``SINGLETON_EPISODE_AFTER_DAYS`` exists
+    to cure, with no cure available — a telemetry row has no singleton rescue
+    waiting for it. Their only exit is ``pass5_forget``, which reaps them on age
+    ALONE precisely because they will never earn a parent to be reaped behind.
+    """
+    clause, params = _exclude_telemetry()
     with db.read_conn() as c:
         rows = c.execute(
-            """
+            f"""
             SELECT * FROM causal_memories
-            WHERE layer = ? AND parent_id IS NULL
+            WHERE layer = ? AND parent_id IS NULL{clause}
             ORDER BY observed_at ASC
             LIMIT ?
             """,
-            (L0_RAW, limit),
+            (L0_RAW, *params, limit),
         ).fetchall()
     return [dict(r) for r in rows]
 
@@ -699,22 +733,15 @@ def pass4_decay(dry_run: bool = False) -> dict[str, int]:
 
 
 def pass5_forget(l0_ttl_days: int = DEFAULT_L0_TTL_DAYS, dry_run: bool = False) -> int:
-    """Delete aged L0 rows that already have a parent.
+    """Delete aged L0 rows that consolidation is finished with.
 
-    The parent check is what makes this safe rather than destructive: a raw
-    record is only forgotten once its content survives inside an episode.
+    A real observation is finished with once an episode carries its content —
+    that is the parent check, and it is what makes this compaction rather than
+    data loss. Telemetry is finished with the moment it is written, since no
+    episode will ever claim it; see ``db.causal_delete_l0_reapable``, which owns
+    both halves of that rule so the dry-run count cannot drift from the delete.
     """
-    if dry_run:
-        with db.read_conn() as c:
-            return int(
-                c.execute(
-                    "SELECT COUNT(*) FROM causal_memories WHERE layer = 0 "
-                    "AND parent_id IS NOT NULL "
-                    "AND observed_at < datetime('now', '-' || ? || ' days')",
-                    (l0_ttl_days,),
-                ).fetchone()[0]
-            )
-    return db.causal_delete_l0_with_parent(l0_ttl_days)
+    return db.causal_delete_l0_reapable(l0_ttl_days, dry_run=dry_run)
 
 
 # ---------------------------------------------------------------------------

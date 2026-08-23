@@ -46,9 +46,11 @@ if str(_HERE) not in sys.path:
 
 import db  # noqa: E402
 import patterns  # noqa: E402
+from db import TELEMETRY_TAGS  # noqa: E402 - re-exported below; owned by the schema layer
 
 __all__ = [
     "BUDGET_MS",
+    "TELEMETRY_TAGS",
     "Observation",
     "Deadline",
     "main",
@@ -246,13 +248,19 @@ def post_tool_observations(payload: dict[str, Any]) -> list[Observation]:
     obs: list[Observation] = []
 
     if snippet and _looks_like_error(response, out_text):
+        # No causal pair: this row fires on every failing call, so an episode
+        # made of nothing else states one claim unanimously, and dream's
+        # _coherent_pair inherits exactly the pairs every member agrees on.
+        # That is how belief:b8991d5e79839166 ("tool_call_bash causes
+        # tool_error", evidence l1:ec3384b5c665449b) came to be asserted from a
+        # log line. A row that claims nothing cannot be agreed with.
         obs.append(
             Observation(
                 text=f"tool `{tool}` reported an error: {snippet}",
                 source_ref=f"{base_ref}#error",
                 session_id=session_id,
-                cause=f"tool_call:{tool}",
-                effect="tool_error",
+                cause=None,
+                effect=None,
                 confidence=0.3,
                 observed_at=str(observed_at),
                 tags=("observer", "post-tool", "tool-error", f"tool:{tool}"),
@@ -401,12 +409,25 @@ def session_end_observations(
                 continue
             counts["friction"] += 1
             entry_ts = entry.get("timestamp") or entry.get("observed_at")
+            # The effect is a real classification and stays. The cause does not:
+            # this line is only reached for an entry that IS a user message, so
+            # `cause="user_message"` restated the detector's own precondition,
+            # and _coherent_pair inherited it unanimously for any session whose
+            # friction was homogeneous — 5 of 8 live sessions, each holding a
+            # single row, where unanimity is trivial.
+            #
+            # What provoked the rejection is not merely unknown here, it is
+            # unwritten: the transcript records `user`, `tool_use` and
+            # `tool_result` entries and no assistant entry at all, so the
+            # agent's side of the exchange is not on disk to be read. An
+            # unobserved cause is left empty rather than filled with the one
+            # thing that is true of every row reaching this line.
             obs.append(
                 Observation(
                     text=f"user {hit['type']}: {hit['match']}",
                     source_ref=f"{ref_base}:{lineno}",
                     session_id=session_id,
-                    cause="user_message",
+                    cause=None,
                     effect=hit["type"],
                     confidence=_damped(hit["confidence"]),
                     observed_at=str(entry_ts) if entry_ts else _now_iso(),
@@ -428,13 +449,17 @@ def session_end_observations(
         f"{counts['friction']} friction signals"
         + (" (scan truncated by budget)" if truncated else "")
     )
+    # No causal pair, for the same reason as the tool-error row above: one of
+    # these is emitted per session unconditionally, so agreement is guaranteed
+    # rather than observed. belief:950649f22e74f369 ("session_end causes
+    # session_summary") is that tautology, promoted to ACTIVE belief state.
     obs.append(
         Observation(
             text=summary,
             source_ref=f"{ref_base}#summary",
             session_id=session_id,
-            cause="session_end",
-            effect="session_summary",
+            cause=None,
+            effect=None,
             confidence=0.3,
             observed_at=_now_iso(),
             tags=("observer", "session-end", "session-summary"),
