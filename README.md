@@ -78,6 +78,54 @@ cd crystallized
 
 ---
 
+## <img src="docs/icons/workflow.svg" width="22" alt="" /> Модели через cliproxyapi
+
+Локальный прокси поднимает OpenAI-совместимый эндпоинт на `127.0.0.1:8317`, и opencode ходит в него как в обычного провайдера.
+
+```bash
+brew install cliproxyapi
+cliproxyapi -antigravity-login    # ещё есть -codex-login, -claude-login, -kimi-login, -xai-login
+brew services start cliproxyapi
+```
+
+Логин кладет OAuth-креды в `auth-dir` из `/opt/homebrew/etc/cliproxyapi.conf` (по умолчанию `~/.cli-proxy-api`). Там же в `api-keys` задается свой локальный ключ — он и идет в `apiKey` ниже.
+
+Фрагмент для `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "provider": {
+    "codex": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "CliproxyAPI",
+      "options": {
+        "baseURL": "http://127.0.0.1:8317/v1",
+        "apiKey": "YOUR_LOCAL_API_KEY"
+      },
+      "models": {
+        "gemini-3.7-flash-high": {
+          "name": "Gemini 3.7 Flash (high)",
+          "limit": { "context": 1048576, "output": 65536 },
+          "attachment": true,
+          "tool_call": true,
+          "modalities": { "input": ["text", "image", "pdf"], "output": ["text"] }
+        }
+      }
+    }
+  }
+}
+```
+
+Какие модели доступны — спроси у прокси и вписывай из этого списка:
+
+```bash
+curl -s -H "Authorization: Bearer YOUR_LOCAL_API_KEY" http://127.0.0.1:8317/v1/models
+```
+
+Если модель отвечает `User location is not supported` — сначала обнови прокси и перезапусти его, дай пару минут прогреться, и только потом ищи причину в сети.
+
+---
+
 ## <img src="docs/icons/laptop.svg" width="22" alt="" /> Переезд на новый компьютер
 
 Купил новый ноутбук? Скопируй свой файл `memory.db` и папку заметок `notes/`. Запусти установщик — и твой агент проснется со всеми своими накопленными татуировками и характером.
