@@ -122,7 +122,13 @@ brew services start cliproxyapi
 curl -s -H "Authorization: Bearer YOUR_LOCAL_API_KEY" http://127.0.0.1:8317/v1/models
 ```
 
-Если модель отвечает `User location is not supported` — сначала обнови прокси и перезапусти его, дай пару минут прогреться, и только потом ищи причину в сети.
+Если модель отвечает `User location is not supported` — гейт висит на хосте, а не на твоём адресе. Добавь в файл креда внутри `auth-dir` поле верхнего уровня и перезапусти прокси:
+
+```json
+"base_url": "https://daily-cloudcode-pa.sandbox.googleapis.com"
+```
+
+Поле переживает обновление токена. Менять выход в сеть, VPN или сервер не нужно.
 
 ---
 
