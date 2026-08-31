@@ -47,6 +47,13 @@ os.environ["OPENCODE_MEMORY_SOCKET"] = str(_SESSION_ROOT / "query.sock")
 os.environ["OPENCODE_MEMORY_DISABLE_CHROMA_API"] = "1"
 os.environ["ANONYMIZED_TELEMETRY"] = "False"
 
+# The observer reads the agent's own turns from opencode's store, which lives
+# outside this project entirely. Point it at a path inside the session root that
+# will never exist, so no test can touch the live 23 GB database: the same
+# structural isolation the OPENCODE_MEMORY_* variables above provide, extended
+# to the one foreign path this suite can reach.
+os.environ["CRYSTALLIZED_AGENT_STORE"] = str(_SESSION_ROOT / "absent-agent-store.db")
+
 (_SESSION_ROOT / "notes").mkdir(parents=True, exist_ok=True)
 
 

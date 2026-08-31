@@ -616,8 +616,9 @@ class TestSessionEndObservations:
         assert patterns.NEGATIVE_CONSTRAINT in effects
         assert patterns.FRUSTRATION in effects
 
-    def test_friction_states_its_type_but_never_a_cause(self, tmp_path):
-        """The effect is a classification; the cause was never written down."""
+    def test_friction_without_a_session_id_states_its_type_but_no_cause(self, tmp_path):
+        """The effect is a classification. The cause is readable only from the
+        agent store, and a payload with no session id cannot address it."""
         path = _write_transcript(tmp_path, [
             {"role": "user", "content": "не трогай этот файл"},
         ])
@@ -886,3 +887,236 @@ class TestObserverBudget:
         start = time.perf_counter()
         observer.main(["--session-end"], stdin_text=payload)
         assert (time.perf_counter() - start) * 1000 < observer.BUDGET_MS * 2
+
+
+# ===========================================================================
+# observer.py — the agent's own half of the exchange
+#
+# The Stop-hook transcript carries `user`, `tool_use` and `tool_result` entries
+# and no assistant entry at all, so for as long as this hook has existed every
+# session summary reported "0 assistant messages" — 656 rows out of 656 in the
+# live store. The turns were never missing, only elsewhere: opencode keeps them
+# in its own database under the same session id the hook payload already holds.
+# ===========================================================================
+
+
+def _write_agent_store(path: Path, session_id: str, rows: list[tuple[int, str, str]]) -> Path:
+    """Build a store shaped like opencode's own.
+
+    ``rows`` are ``(epoch_ms, role, text)``. A row whose text is empty stands for
+    a turn that produced no prose — a tool-only step — and gets a message with
+    no text part, which is exactly how the real store records one.
+    """
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE message ("
+        " id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL,"
+        " time_updated INTEGER NOT NULL, data TEXT NOT NULL);"
+        "CREATE TABLE part ("
+        " id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL,"
+        " time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);"
+    )
+    for ix, (at, role, text) in enumerate(rows):
+        mid = f"msg{ix}"
+        conn.execute(
+            "INSERT INTO message VALUES (?,?,?,?,?)",
+            (mid, session_id, at, at, json.dumps({"role": role})),
+        )
+        if text:
+            conn.execute(
+                "INSERT INTO part VALUES (?,?,?,?,?,?)",
+                (f"prt{ix}", mid, session_id, at, at,
+                 json.dumps({"type": "text", "text": text}, ensure_ascii=False)),
+            )
+        conn.execute(
+            "INSERT INTO part VALUES (?,?,?,?,?,?)",
+            (f"rsn{ix}", mid, session_id, at, at,
+             json.dumps({"type": "reasoning", "text": "not spoken aloud"})),
+        )
+    conn.commit()
+    conn.close()
+    return path
+
+
+class TestEpochMs:
+    def test_iso_with_zulu_suffix(self):
+        assert observer._epoch_ms("2026-08-30T19:38:12.559Z") == 1788118692559
+
+    def test_iso_with_offset(self):
+        assert observer._epoch_ms("2026-08-31T00:38:12.559+05:00") == 1788118692559
+
+    def test_naive_stamp_is_read_as_utc(self):
+        assert observer._epoch_ms("2026-08-30T19:38:12.559") == 1788118692559
+
+    def test_integer_milliseconds_pass_through(self):
+        assert observer._epoch_ms(1788118692559) == 1788118692559
+
+    @pytest.mark.parametrize("junk", ["", "   ", "yesterday", None, True, [], {"a": 1}])
+    def test_unparseable_stamp_is_none_never_a_guess(self, junk):
+        assert observer._epoch_ms(junk) is None
+
+
+class TestAgentSide:
+    def test_reads_turns_oldest_first(self, tmp_path, monkeypatch):
+        store = _write_agent_store(tmp_path / "agent.db", "s1", [
+            (2000, "assistant", "second"),
+            (1000, "assistant", "first"),
+        ])
+        monkeypatch.setattr(observer, "AGENT_STORE", store)
+        count, turns = observer.agent_side("s1")
+        assert [t for _, t in turns] == ["first", "second"]
+        assert count == 2
+
+    def test_counts_messages_not_spoken_parts(self, tmp_path, monkeypatch):
+        """A tool-only turn is a message the agent took but not a thing it said."""
+        store = _write_agent_store(tmp_path / "agent.db", "s1", [
+            (1000, "assistant", "spoke"),
+            (2000, "assistant", ""),
+            (3000, "assistant", ""),
+        ])
+        monkeypatch.setattr(observer, "AGENT_STORE", store)
+        count, turns = observer.agent_side("s1")
+        assert count == 3
+        assert len(turns) == 1
+
+    def test_user_rows_and_reasoning_are_excluded(self, tmp_path, monkeypatch):
+        store = _write_agent_store(tmp_path / "agent.db", "s1", [
+            (1000, "user", "a question"),
+            (2000, "assistant", "an answer"),
+        ])
+        monkeypatch.setattr(observer, "AGENT_STORE", store)
+        count, turns = observer.agent_side("s1")
+        assert count == 1
+        assert [t for _, t in turns] == ["an answer"]
+
+    def test_other_sessions_are_not_visible(self, tmp_path, monkeypatch):
+        store = _write_agent_store(tmp_path / "agent.db", "s1", [(1000, "assistant", "mine")])
+        monkeypatch.setattr(observer, "AGENT_STORE", store)
+        assert observer.agent_side("s2") == (0, [])
+
+    def test_missing_store_degrades_silently(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(observer, "AGENT_STORE", tmp_path / "nope.db")
+        assert observer.agent_side("s1") == (0, [])
+
+    def test_foreign_schema_degrades_silently(self, tmp_path, monkeypatch):
+        """The store belongs to another project and may be reshaped without notice."""
+        alien = tmp_path / "alien.db"
+        conn = sqlite3.connect(alien)
+        conn.execute("CREATE TABLE unrelated (x INTEGER)")
+        conn.commit()
+        conn.close()
+        monkeypatch.setattr(observer, "AGENT_STORE", alien)
+        assert observer.agent_side("s1") == (0, [])
+
+    def test_unreadable_file_degrades_silently(self, tmp_path, monkeypatch):
+        junk = tmp_path / "junk.db"
+        junk.write_bytes(b"this is not a database")
+        monkeypatch.setattr(observer, "AGENT_STORE", junk)
+        assert observer.agent_side("s1") == (0, [])
+
+    def test_absent_session_id_skips_the_store_entirely(self, tmp_path, monkeypatch):
+        store = _write_agent_store(tmp_path / "agent.db", "s1", [(1000, "assistant", "hi")])
+        monkeypatch.setattr(observer, "AGENT_STORE", store)
+        assert observer.agent_side(None) == (0, [])
+
+    def test_expired_deadline_skips_the_store(self, tmp_path, monkeypatch):
+        store = _write_agent_store(tmp_path / "agent.db", "s1", [(1000, "assistant", "hi")])
+        monkeypatch.setattr(observer, "AGENT_STORE", store)
+        assert observer.agent_side("s1", observer.Deadline(budget_ms=0.0)) == (0, [])
+
+
+class TestTurnBefore:
+    TURNS = [(1000, "first"), (2000, "second"), (3000, "third")]
+
+    def test_picks_the_turn_immediately_preceding(self):
+        assert observer._turn_before(self.TURNS, 2500) == "second"
+
+    def test_a_turn_at_the_same_instant_still_precedes(self):
+        assert observer._turn_before(self.TURNS, 2000) == "second"
+
+    def test_moment_before_every_turn_has_no_cause(self):
+        assert observer._turn_before(self.TURNS, 500) is None
+
+    def test_no_turns_means_no_cause(self):
+        assert observer._turn_before([], 2500) is None
+
+    def test_unparseable_moment_means_no_cause(self):
+        assert observer._turn_before(self.TURNS, None) is None
+
+    def test_text_is_flattened_and_clipped(self):
+        long = "a" * (observer.AGENT_TURN_CHARS + 50)
+        got = observer._turn_before([(1000, f"line\n\n  {long}")], 2000)
+        assert got is not None
+        assert "\n" not in got
+        assert len(got) == observer.AGENT_TURN_CHARS
+
+
+class TestSessionEndReadsTheAgentSide:
+    def test_summary_reports_the_real_assistant_count(self, tmp_path, monkeypatch):
+        store = _write_agent_store(tmp_path / "agent.db", "s9", [
+            (1000, "assistant", "one"),
+            (2000, "assistant", "two"),
+        ])
+        monkeypatch.setattr(observer, "AGENT_STORE", store)
+        path = _write_transcript(tmp_path, [{"role": "user", "content": "ok"}])
+        obs = observer.session_end_observations({"session_id": "s9"}, path)
+        assert "2 assistant messages" in obs[-1].text
+
+    def test_friction_inherits_the_turn_that_provoked_it(self, tmp_path, monkeypatch):
+        store = _write_agent_store(tmp_path / "agent.db", "s9", [
+            (1000, "assistant", "я перепишу этот файл целиком"),
+            (5000, "assistant", "уже после отказа"),
+        ])
+        monkeypatch.setattr(observer, "AGENT_STORE", store)
+        path = _write_transcript(tmp_path, [{
+            "role": "user",
+            "content": "не трогай этот файл",
+            "timestamp": "1970-01-01T00:00:02Z",
+        }])
+        obs = observer.session_end_observations({"session_id": "s9"}, path)
+        friction = [o for o in obs if o.effect == patterns.NEGATIVE_CONSTRAINT]
+        assert len(friction) == 1
+        assert friction[0].cause == "я перепишу этот файл целиком"
+
+    def test_friction_before_any_turn_keeps_an_empty_cause(self, tmp_path, monkeypatch):
+        """An unobserved cause stays unobserved rather than take the nearest turn."""
+        store = _write_agent_store(tmp_path / "agent.db", "s9", [
+            (9000, "assistant", "сказано уже после"),
+        ])
+        monkeypatch.setattr(observer, "AGENT_STORE", store)
+        path = _write_transcript(tmp_path, [{
+            "role": "user",
+            "content": "не трогай этот файл",
+            "timestamp": "1970-01-01T00:00:02Z",
+        }])
+        obs = observer.session_end_observations({"session_id": "s9"}, path)
+        friction = [o for o in obs if o.effect == patterns.NEGATIVE_CONSTRAINT]
+        assert friction and friction[0].cause is None
+
+    def test_transcript_assistant_rows_are_the_fallback_not_the_source(self, tmp_path, monkeypatch):
+        """A host that does write assistant entries must still be counted."""
+        monkeypatch.setattr(observer, "AGENT_STORE", tmp_path / "nope.db")
+        path = _write_transcript(tmp_path, [
+            {"role": "assistant", "content": "a"},
+            {"role": "assistant", "content": "b"},
+            {"role": "user", "content": "ok"},
+        ])
+        obs = observer.session_end_observations({"session_id": "s9"}, path)
+        assert "2 assistant messages" in obs[-1].text
+
+    def test_unreadable_store_leaves_the_summary_shaped_as_before(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(observer, "AGENT_STORE", tmp_path / "nope.db")
+        path = _write_transcript(tmp_path, [{"role": "user", "content": "ok"}])
+        obs = observer.session_end_observations({"session_id": "s9"}, path)
+        assert "0 assistant messages" in obs[-1].text
+
+    def test_reading_the_store_stays_inside_the_budget(self, tmp_path, monkeypatch):
+        store = _write_agent_store(tmp_path / "agent.db", "s9", [
+            (i * 1000, "assistant", f"turn {i}") for i in range(1, 400)
+        ])
+        monkeypatch.setattr(observer, "AGENT_STORE", store)
+        path = _write_transcript(tmp_path, [{"role": "user", "content": "ok"}])
+        observer.session_end_observations({"session_id": "s9"}, path)  # warm
+        start = time.perf_counter()
+        observer.session_end_observations({"session_id": "s9"}, path)
+        assert (time.perf_counter() - start) * 1000 < observer.BUDGET_MS

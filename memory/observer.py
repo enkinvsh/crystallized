@@ -34,6 +34,7 @@ import sqlite3
 import sys
 import time
 from collections.abc import Iterator
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from hashlib import blake2s
@@ -53,6 +54,7 @@ __all__ = [
     "TELEMETRY_TAGS",
     "Observation",
     "Deadline",
+    "agent_side",
     "main",
     "parse_payload",
     "post_tool_observations",
@@ -77,6 +79,26 @@ MAX_LINE_BYTES: int = 256 * 1024
 
 #: Slice of a tool output kept as evidence text.
 SNIPPET_CHARS: int = 280
+
+#: Authoritative store for the agent's own turns.
+#:
+#: The Stop-hook transcript carries `user`, `tool_use` and `tool_result` entries
+#: and nothing else — the agent's side of the exchange is never written to it.
+#: That is why every session summary this hook has ever emitted read "0
+#: assistant messages", 656 rows out of 656: not a parser bug, a source that
+#: does not hold the data. The turns do exist, keyed by the very session id the
+#: payload already carries, in opencode's own store.
+AGENT_STORE: Path = Path(
+    os.environ.get("CRYSTALLIZED_AGENT_STORE")
+    or (Path.home() / ".local" / "share" / "opencode" / "opencode.db")
+).expanduser()
+
+#: Newest N agent turns pulled per session. Only the turn adjacent to a friction
+#: signal is ever read, so this is a safety rail rather than a tuning knob.
+MAX_AGENT_TURNS: int = 200
+
+#: Slice of an agent turn kept as the cause of a friction signal.
+AGENT_TURN_CHARS: int = 400
 
 #: Stage-A damping. A regex hit is weak evidence; `dream.py` promotes it after
 #: cross-session corroboration. 0.75 * 0.4 == 0.30, the documented L0 baseline.
@@ -371,6 +393,105 @@ def _resolve_transcript(payload: dict[str, Any], argv: list[str]) -> Path | None
     return None
 
 
+def _epoch_ms(value: Any) -> int | None:
+    """Milliseconds since the epoch, or None when the stamp cannot be trusted.
+
+    The transcript stamps ISO-8601 with a ``Z`` suffix while the agent store
+    writes integer milliseconds. They are the same clock — measured 16 ms apart
+    on the two halves of one exchange — so pairing across them is sound. Any
+    stamp that will not parse returns None instead of a guess: a wrong pairing
+    here would manufacture causality, which is precisely what this module is
+    forbidden to do.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = f"{text[:-1]}+00:00"
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return int(moment.timestamp() * 1000)
+
+
+def agent_side(
+    session_id: str | None,
+    deadline: Deadline | None = None,
+) -> tuple[int, list[tuple[int, str]]]:
+    """The agent's half of a session: ``(message count, spoken turns)``.
+
+    Turns are ``(epoch_ms, text)`` oldest first and carry only what the agent
+    actually SAID. Reasoning blocks, tool calls and step markers are excluded on
+    purpose: the question a friction signal needs answered is "what did the user
+    just read", and the user reads none of those.
+
+    Read-only, budget-aware, and fail-soft in every direction. A missing store,
+    a schema that has moved, a lock, an exhausted deadline — each yields
+    ``(0, [])`` so the summary degrades to its old behaviour rather than
+    endangering a hook whose contract is to always exit 0.
+    """
+    if not session_id or (deadline is not None and deadline.expired()):
+        return 0, []
+    if not AGENT_STORE.exists():
+        return 0, []
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(f"file:{AGENT_STORE}?mode=ro", uri=True, timeout=0.05)
+        spoken = conn.execute(
+            "SELECT m.time_created AS at, json_extract(p.data, '$.text') AS said "
+            "FROM part p JOIN message m ON p.message_id = m.id "
+            "WHERE p.session_id = ? "
+            "AND json_extract(m.data, '$.role') = 'assistant' "
+            "AND json_extract(p.data, '$.type') = 'text' "
+            "ORDER BY m.time_created DESC LIMIT ?",
+            (session_id, MAX_AGENT_TURNS),
+        ).fetchall()
+        counted = conn.execute(
+            "SELECT COUNT(*) FROM message WHERE session_id = ? "
+            "AND json_extract(data, '$.role') = 'assistant'",
+            (session_id,),
+        ).fetchone()
+    except (sqlite3.Error, OSError, ValueError):
+        return 0, []
+    finally:
+        if conn is not None:
+            with suppress(sqlite3.Error):
+                conn.close()
+    turns = [
+        (int(at), said)
+        for at, said in spoken
+        if at is not None and isinstance(said, str) and said.strip()
+    ]
+    turns.reverse()
+    total = int(counted[0]) if counted and counted[0] is not None else len(turns)
+    return total, turns
+
+
+def _turn_before(turns: list[tuple[int, str]], when_ms: int | None) -> str | None:
+    """The last thing the agent said before ``when_ms``, flattened and clipped.
+
+    None when the store gave us nothing, when the stamp did not parse, or when
+    the moment precedes every turn — an unobserved cause stays unobserved.
+    """
+    if not turns or when_ms is None:
+        return None
+    said: str | None = None
+    for at, text in turns:
+        if at > when_ms:
+            break
+        said = text
+    if said is None:
+        return None
+    return " ".join(said.split())[:AGENT_TURN_CHARS] or None
+
+
 def session_end_observations(
     payload: dict[str, Any],
     transcript: Path | None,
@@ -386,6 +507,11 @@ def session_end_observations(
     counts = {"user": 0, "assistant": 0, "tool": 0, "friction": 0, "lines": 0}
     truncated = False
 
+    # Read the agent's own half BEFORE the scan, so every friction signal found
+    # below can be paired with the turn that provoked it.
+    agent_messages, agent_turns = agent_side(session_id, deadline)
+    transcript_assistant = 0
+
     if transcript is not None:
         for lineno, entry in iter_transcript(transcript):
             if deadline.expired():
@@ -396,7 +522,7 @@ def session_end_observations(
             if _has_tool_use(entry):
                 counts["tool"] += 1
             if role in ("assistant", "ai"):
-                counts["assistant"] += 1
+                transcript_assistant += 1
                 continue
             if role not in ("user", "human"):
                 continue
@@ -409,25 +535,27 @@ def session_end_observations(
                 continue
             counts["friction"] += 1
             entry_ts = entry.get("timestamp") or entry.get("observed_at")
-            # The effect is a real classification and stays. The cause does not:
-            # this line is only reached for an entry that IS a user message, so
-            # `cause="user_message"` restated the detector's own precondition,
-            # and _coherent_pair inherited it unanimously for any session whose
-            # friction was homogeneous — 5 of 8 live sessions, each holding a
-            # single row, where unanimity is trivial.
+            # The effect is a real classification and stays. The cause used to
+            # be empty: this line is only reached for an entry that IS a user
+            # message, so `cause="user_message"` restated the detector's own
+            # precondition, and _coherent_pair inherited it unanimously for any
+            # session whose friction was homogeneous.
             #
-            # What provoked the rejection is not merely unknown here, it is
-            # unwritten: the transcript records `user`, `tool_use` and
-            # `tool_result` entries and no assistant entry at all, so the
-            # agent's side of the exchange is not on disk to be read. An
-            # unobserved cause is left empty rather than filled with the one
-            # thing that is true of every row reaching this line.
+            # What provoked the rejection was not merely unknown, it was
+            # unwritten — the transcript records `user`, `tool_use` and
+            # `tool_result` entries and no assistant entry at all. It is written
+            # now, just not there: `agent_side` reads the same exchange from
+            # opencode's own store, and the turn immediately preceding the
+            # rejection is what the user was reacting to when they wrote it.
+            # Still None when that store cannot be read or when the rejection
+            # precedes every turn, because an unobserved cause must stay
+            # unobserved rather than be filled with the nearest plausible thing.
             obs.append(
                 Observation(
                     text=f"user {hit['type']}: {hit['match']}",
                     source_ref=f"{ref_base}:{lineno}",
                     session_id=session_id,
-                    cause=None,
+                    cause=_turn_before(agent_turns, _epoch_ms(entry_ts)),
                     effect=hit["type"],
                     confidence=_damped(hit["confidence"]),
                     observed_at=str(entry_ts) if entry_ts else _now_iso(),
@@ -442,6 +570,11 @@ def session_end_observations(
                     + (("frustration",) if hit["frustration"] else ()),
                 )
             )
+
+    # The store is authoritative; the transcript tally is a fallback for a host
+    # that does keep assistant entries there. Preferring the store unconditionally
+    # would report 0 for such a host the moment the store moved.
+    counts["assistant"] = agent_messages or transcript_assistant
 
     summary = (
         f"session {session_id or 'unknown'} ended: {counts['user']} user messages, "
