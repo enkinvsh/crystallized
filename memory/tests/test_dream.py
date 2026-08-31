@@ -943,58 +943,120 @@ class TestCoherentPair:
         assert dream._coherent_pair([]) == (None, None)
 
 
-class TestBeliefProjection:
-    def test_requires_both_cause_and_effect(self):
-        assert dream.belief_from({"cause": "a", "effect": None}) is None
-        assert dream.belief_from({"cause": "", "effect": "b"}) is None
+def _add_axiom(mid, theme, claim, *, days_ago=0.0, confidence=0.8):
+    """An L3 axiom: a standing rule about a theme, which is what a belief is."""
+    db.causal_insert(
+        id=mid,
+        text=claim,
+        layer=3,
+        confidence=confidence,
+        observed_at=_iso(days_ago),
+        tags=theme,
+    )
 
-    def test_projects_a_triple(self):
-        triple = dream.belief_from({"cause": "Stale Lock", "effect": "build fails",
-                                    "confidence": 0.7})
-        assert triple == ("stale_lock", "causes", "build fails", 0.7)
+
+class TestBeliefProjection:
+    def test_only_axioms_qualify(self):
+        """Every rung below L3 records what happened once, not what is true."""
+        for layer in (0, 1, 2):
+            assert dream.belief_from(
+                {"layer": layer, "text": "something", "tags": "build"}
+            ) is None
+
+    def test_projects_a_namespaced_triple(self):
+        triple = dream.belief_from({
+            "layer": 3, "tags": "build", "confidence": 0.7,
+            "text": "Stale lock breaks the build",
+        })
+        assert triple == (
+            "build.stale_lock_breaks_the_build",
+            "axiom",
+            "Stale lock breaks the build",
+            0.7,
+        )
+
+    def test_subject_segments_stay_short_enough_to_address(self):
+        """The old cap was hit by every subject dream wrote; a key that encodes
+        its whole row cannot be looked up, only scanned for."""
+        subject, _, _, _ = dream.belief_from({
+            "layer": 3, "tags": "build", "text": "слово " * 200,
+        })
+        theme, _, claim = subject.partition(".")
+        assert theme == "build"
+        assert len(claim) == dream.SUBJECT_SEGMENT_CHARS
+
+    def test_synthesized_title_is_stripped_from_the_claim(self):
+        """`Axiom «build»:` only restates the theme and discriminates nothing."""
+        subject, _, _, _ = dream.belief_from({
+            "layer": 3, "tags": "build",
+            "text": "Axiom «build»:\n- the lockfile must be regenerated",
+        })
+        assert subject == "build.the_lockfile_must_be_regenerated"
+
+    def test_untagged_axiom_falls_back_to_a_bare_namespace(self):
+        subject, _, _, _ = dream.belief_from({
+            "layer": 3, "tags": "", "text": "a rule with no theme",
+        })
+        assert subject == "axiom.a_rule_with_no_theme"
+
+    def test_empty_text_is_not_a_belief(self):
+        assert dream.belief_from({"layer": 3, "tags": "build", "text": "   "}) is None
+
+    def test_object_is_clipped(self):
+        _, _, obj, _ = dream.belief_from({
+            "layer": 3, "tags": "build", "text": "x" * 5000,
+        })
+        assert len(obj) == dream.BELIEF_OBJECT_CHARS
 
     def test_id_is_deterministic_but_time_scoped(self):
-        a = dream.belief_id("s", "causes", "o", "2026-01-01")
-        b = dream.belief_id("s", "causes", "o", "2026-01-01")
-        c = dream.belief_id("s", "causes", "o", "2026-06-01")
+        a = dream.belief_id("s", "axiom", "o", "2026-01-01")
+        b = dream.belief_id("s", "axiom", "o", "2026-01-01")
+        c = dream.belief_id("s", "axiom", "o", "2026-06-01")
         assert a == b != c
 
 
 class TestPass3Reconcile:
     def test_asserts_a_new_belief(self, temp_db):
-        _add_ln("e1", 1, "stale lock", "build fails")
+        _add_axiom("a1", "build", "stale lock breaks the build")
         stats = dream.pass3_reconcile()
         assert stats["asserted"] == 1
-        assert db.belief_get_active("stale_lock", "causes")["object"] == "build fails"
+        got = db.belief_get_active("build.stale_lock_breaks_the_build", "axiom")
+        assert got["object"] == "stale lock breaks the build"
 
     def test_ignores_l0_records(self, temp_db):
         _add_l0("m1", "x", cause="stale lock", effect="build fails")
         assert dream.pass3_reconcile()["asserted"] == 0
 
-    def test_ignores_memories_without_a_causal_pair(self, temp_db):
-        db.causal_insert(id="e1", text="just a note", layer=1)
+    def test_ignores_the_rungs_below_an_axiom(self, temp_db):
+        _add_ln("e1", 1, "stale lock", "build fails")
+        _add_ln("e2", 2, "cold cache", "first run is slow")
         assert dream.pass3_reconcile()["asserted"] == 0
 
     def test_a_stable_belief_is_never_churned(self, temp_db):
-        _add_ln("e1", 1, "stale lock", "build fails")
+        _add_axiom("a1", "build", "stale lock breaks the build")
         dream.pass3_reconcile()
-        first = db.belief_get_active("stale_lock", "causes")
+        first = db.belief_get_active("build.stale_lock_breaks_the_build", "axiom")
         stats = dream.pass3_reconcile()
         assert stats == {"asserted": 0, "superseded": 0, "unchanged": 1,
                          "rejected": 0, "shadowed": 0}
-        assert db.belief_get_active("stale_lock", "causes")["id"] == first["id"]
+        got = db.belief_get_active("build.stale_lock_breaks_the_build", "axiom")
+        assert got["id"] == first["id"]
 
     def test_newer_contradiction_supersedes_and_back_links(self, temp_db):
-        _add_ln("e1", 1, "stale lock", "build fails", days_ago=10)
+        head = "the lockfile decides whether the build can be reproduced at all"
+        _add_axiom("a1", "build", f"{head}, and a stale one fails it", days_ago=10)
         dream.pass3_reconcile()
-        old = db.belief_get_active("stale_lock", "causes")
+        subject = dream.belief_from(
+            {"layer": 3, "tags": "build", "text": f"{head}, and a stale one fails it"}
+        )[0]
+        old = db.belief_get_active(subject, "axiom")
 
-        _add_ln("e2", 1, "stale lock", "build is merely slow", days_ago=1)
+        _add_axiom("a2", "build", f"{head}, and a stale one merely slows it", days_ago=1)
         stats = dream.pass3_reconcile()
 
         assert (stats["asserted"], stats["superseded"]) == (1, 1)
-        new = db.belief_get_active("stale_lock", "causes")
-        assert new["object"] == "build is merely slow"
+        new = db.belief_get_active(subject, "axiom")
+        assert new["object"].endswith("merely slows it")
 
         with db.read_conn() as c:
             row = dict(c.execute(
@@ -1006,58 +1068,79 @@ class TestPass3Reconcile:
         assert new["supersedes"] == old["id"]
 
     def test_a_much_more_confident_incumbent_survives(self, temp_db):
-        _add_ln("e1", 1, "stale lock", "build fails", days_ago=10, confidence=0.95)
+        head = "the lockfile decides whether the build can be reproduced at all"
+        _add_axiom("a1", "build", f"{head}, and a stale one fails it",
+                   days_ago=10, confidence=0.95)
         dream.pass3_reconcile()
-        _add_ln("e2", 1, "stale lock", "nothing happens", days_ago=1, confidence=0.2)
+        _add_axiom("a2", "build", f"{head}, and a stale one is harmless",
+                   days_ago=1, confidence=0.2)
 
         stats = dream.pass3_reconcile()
 
         assert stats["rejected"] == 1
         assert stats["asserted"] == 0
-        assert db.belief_get_active("stale_lock", "causes")["object"] == "build fails"
+        subject = dream.belief_from(
+            {"layer": 3, "tags": "build", "text": f"{head}, and a stale one fails it"}
+        )[0]
+        assert db.belief_get_active(subject, "axiom")["object"].endswith("fails it")
 
     def test_only_the_newest_claim_of_a_run_is_asserted(self, temp_db):
-        """Two contradicting memories in one run: the older one is shadowed."""
-        _add_ln("e1", 1, "stale lock", "build fails", days_ago=10)
-        _add_ln("e2", 1, "stale lock", "build is slow", days_ago=1)
+        """Two claims sharing a subject in one run: the older one is shadowed."""
+        head = "the lockfile decides whether the build can be reproduced at all"
+        _add_axiom("a1", "build", f"{head}, and a stale one fails it", days_ago=10)
+        _add_axiom("a2", "build", f"{head}, and a stale one is slow", days_ago=1)
 
         stats = dream.pass3_reconcile()
 
         assert stats["asserted"] == 1
         assert stats["shadowed"] == 1
-        assert db.belief_get_active("stale_lock", "causes")["object"] == "build is slow"
+        subject = dream.belief_from(
+            {"layer": 3, "tags": "build", "text": f"{head}, and a stale one is slow"}
+        )[0]
+        assert db.belief_get_active(subject, "axiom")["object"].endswith("is slow")
 
     def test_a_flip_flop_does_not_collide_on_primary_key(self, temp_db):
         """A -> B -> A must produce three distinct historical rows."""
-        _add_ln("e1", 1, "topic", "A", days_ago=30)
+        head = "the lockfile decides whether the build can be reproduced at all"
+        _add_axiom("a1", "build", f"{head}: A", days_ago=30)
         dream.pass3_reconcile()
-        _add_ln("e2", 1, "topic", "B", days_ago=20)
+        _add_axiom("a2", "build", f"{head}: B", days_ago=20)
         dream.pass3_reconcile()
-        _add_ln("e3", 1, "topic", "A", days_ago=10)
+        _add_axiom("a3", "build", f"{head}: A", days_ago=10)
         dream.pass3_reconcile()
 
-        assert db.belief_get_active("topic", "causes")["object"] == "A"
+        subject = dream.belief_from(
+            {"layer": 3, "tags": "build", "text": f"{head}: A"}
+        )[0]
+        assert db.belief_get_active(subject, "axiom")["object"].endswith(": A")
         with db.read_conn() as c:
             total = c.execute("SELECT COUNT(*) FROM belief_state").fetchone()[0]
         assert total == 3
 
+    def test_axioms_of_one_theme_coexist_instead_of_superseding(self, temp_db):
+        """Nine dropweb axioms are nine standing rules, not one arbitrary winner."""
+        for ix in range(9):
+            _add_axiom(f"a{ix}", "dropweb", f"rule number {ix} about dropweb")
+        assert dream.pass3_reconcile()["asserted"] == 9
+        assert len(db.belief_all_active()) == 9
+
     def test_distinct_subjects_coexist(self, temp_db):
-        _add_ln("e1", 1, "stale lock", "build fails")
-        _add_ln("e2", 1, "cold cache", "first run is slow")
+        _add_axiom("a1", "build", "stale lock breaks the build")
+        _add_axiom("a2", "cache", "a cold cache makes the first run slow")
         assert dream.pass3_reconcile()["asserted"] == 2
         assert len(db.belief_all_active()) == 2
 
     def test_records_the_evidence_and_the_source(self, temp_db):
-        _add_ln("e1", 1, "stale lock", "build fails")
+        _add_axiom("a1", "build", "stale lock breaks the build")
         dream.pass3_reconcile()
-        belief = db.belief_get_active("stale_lock", "causes")
-        assert belief["evidence_id"] == "e1"
+        belief = db.belief_get_active("build.stale_lock_breaks_the_build", "axiom")
+        assert belief["evidence_id"] == "a1"
         assert belief["source"] == "dream"
 
     def test_dry_run_writes_nothing(self, temp_db):
-        _add_ln("e1", 1, "stale lock", "build fails")
+        _add_axiom("a1", "build", "stale lock breaks the build")
         assert dream.pass3_reconcile(dry_run=True)["asserted"] == 1
-        assert db.belief_get_active("stale_lock", "causes") is None
+        assert db.belief_get_active("build.stale_lock_breaks_the_build", "axiom") is None
 
 
 # ===========================================================================
@@ -1198,6 +1281,7 @@ class TestConsolidate:
         """The session states ONE claim twice, so the episode may carry it."""
         _add_l0("m1", "build failed because the lockfile was stale", session="s")
         _add_l0("m2", "build failed because the lockfile was stale", session="s")
+        _add_axiom("a1", "build", "a stale lockfile is what breaks the build")
 
         stats = dream.consolidate()
 
@@ -1208,6 +1292,18 @@ class TestConsolidate:
         assert stats["dry_run"] is False
         assert stats["duration_sec"] >= 0
         assert db.belief_all_active()
+
+    def test_an_episode_alone_promotes_no_belief(self, temp_db):
+        """A session that reached only L1 has recorded what happened, not what
+        is standing true — and only the latter is a belief."""
+        _add_l0("m1", "build failed because the lockfile was stale", session="s")
+        _add_l0("m2", "build failed because the lockfile was stale", session="s")
+
+        stats = dream.consolidate()
+
+        assert stats["pass2_compress"]["l1"] == 1
+        assert stats["pass3_reconcile"]["asserted"] == 0
+        assert db.belief_all_active() == []
 
     def test_a_session_that_disagrees_promotes_no_belief(self, temp_db):
         """Two different claims in one session must not be welded into a third."""

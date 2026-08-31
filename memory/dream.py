@@ -347,11 +347,27 @@ def extract_cause_effect(text: str) -> tuple[str, str] | None:
     return None
 
 
-def normalize_subject(text: str) -> str:
+#: Cap for one segment of a generated belief subject.
+#:
+#: The old cap was 120, and it was not a cap but a guillotine: all 95 subjects
+#: dream had written hit it to the character, because the input was a whole
+#: sentence and the key had to stay unique per row. A key that must encode its
+#: own row to stay unique is not a key — `belief_get_active` could never be
+#: called with one, only a full table scan could find it.
+SUBJECT_SEGMENT_CHARS: int = 48
+
+#: Predicate under which a distilled axiom is asserted.
+AXIOM_PREDICATE: str = "axiom"
+
+#: Cap on the object side of a projected belief.
+BELIEF_OBJECT_CHARS: int = 600
+
+
+def normalize_subject(text: str, limit: int = SUBJECT_SEGMENT_CHARS) -> str:
     """Collapse free text into a stable belief subject key."""
     flat = " ".join((text or "").split()).lower()
     flat = re.sub(r"[^\w./-]+", "_", flat, flags=re.UNICODE).strip("_")
-    return flat[:120] or "unknown"
+    return flat[:limit] or "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -610,28 +626,62 @@ def pass2_compress(
 # ---------------------------------------------------------------------------
 
 
-def belief_from(memory: dict) -> tuple[str, str, str, float] | None:
-    """Project a causal memory onto a ``(subject, predicate, object)`` triple.
+def _axiom_theme(memory: dict) -> str:
+    """The namespace an axiom belongs to: its first tag, or a bare fallback."""
+    first = str(memory.get("tags") or "").split(",")[0].strip()
+    return normalize_subject(first) if first else AXIOM_PREDICATE
 
-    Only records that carry BOTH a cause and an effect qualify: a belief is a
-    claim about how the world reacts, and half of one is just an observation.
+
+def _axiom_claim(said: str) -> str:
+    """The discriminating head of an axiom, with its own title stripped.
+
+    A synthesized axiom opens with ``Axiom «theme»:`` and then its bullets. That
+    header only restates the theme, so leaving it in would make every axiom
+    under one theme share a prefix and discriminate nothing.
     """
-    cause = (memory.get("cause") or "").strip()
-    effect = (memory.get("effect") or "").strip()
-    if not cause or not effect:
+    body = re.sub(r"^\s*axiom\s*«[^»]*»\s*:?\s*", "", said, flags=re.IGNORECASE)
+    return body.lstrip("-–—•* \t")
+
+
+def belief_from(memory: dict) -> tuple[str, str, str, float] | None:
+    """Project a memory onto a ``(subject, predicate, object)`` triple.
+
+    ONLY axioms qualify. A belief answers "what is currently true of X"; every
+    rung below L3 answers "what happened once", and those are different shapes.
+    Forcing the lower rungs in is what produced 95 of the live store's 96
+    beliefs with a whole sentence for a subject and ``causes`` for a predicate:
+    a log entry has no identity smaller than itself, so the key had to grow
+    until it swallowed the row, and then nothing could look it up.
+
+    The subject is a dotted namespace, ``<theme>.<claim>``, which is the
+    convention the schema already documents (``user.preferences``,
+    ``dropweb.testing``) and which ``belief_all_active`` enumerates by prefix.
+    Nine dropweb axioms therefore stay nine addressable beliefs rather than
+    eight superseding each other into one arbitrary survivor.
+    """
+    if int(memory.get("layer") or 0) != L3_AXIOM:
         return None
+    said = " ".join(str(memory.get("text") or "").split())
+    if not said:
+        return None
+    theme = _axiom_theme(memory)
+    claim = normalize_subject(_axiom_claim(said))
+    subject = theme if claim == "unknown" else f"{theme}.{claim}"
     confidence = float(memory.get("confidence") or 0.5)
-    return normalize_subject(cause), "causes", " ".join(effect.split()), confidence
+    return subject, AXIOM_PREDICATE, said[:BELIEF_OBJECT_CHARS], confidence
 
 
 def _belief_candidates() -> list[dict]:
-    """Abstracted memories (L1+), newest first — the freshest claim is the one
-    that gets to speak for its subject this run."""
+    """Axioms, newest first — the freshest distillation speaks for its subject.
+
+    Scoped to L3 because that is the only rung ``belief_from`` accepts; selecting
+    L1 and L2 as well would read thousands of rows to discard every one.
+    """
     with db.read_conn() as c:
         rows = c.execute(
-            "SELECT * FROM causal_memories WHERE layer >= ? "
+            "SELECT * FROM causal_memories WHERE layer = ? "
             "ORDER BY observed_at DESC, id DESC",
-            (L1_EPISODE,),
+            (L3_AXIOM,),
         ).fetchall()
     return [dict(r) for r in rows]
 
