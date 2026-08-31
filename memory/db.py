@@ -1099,11 +1099,21 @@ def belief_get_active(subject: str, predicate: str) -> dict | None:
 
 
 def belief_all_active(subject: str | None = None) -> list[dict]:
+    """Active beliefs, optionally scoped to a subject NAMESPACE.
+
+    ``subject`` matches the exact key or any dotted child of it, so
+    ``"dropweb"`` reaches ``dropweb.media_shutter`` the way the ``belief_list_active``
+    tool has always claimed it did. Exact-match-only made every namespaced
+    subject unreachable except by naming it in full, which defeats the point of
+    a namespace. The separator is anchored so ``"drop"`` never captures
+    ``"dropweb"``.
+    """
     with read_conn() as c:
         if subject:
             rows = c.execute(
-                "SELECT * FROM belief_state WHERE subject = ? AND status = 'active' ORDER BY subject, predicate",
-                (subject,),
+                "SELECT * FROM belief_state WHERE (subject = ? OR subject LIKE ? ESCAPE '\\') "
+                "AND status = 'active' ORDER BY subject, predicate",
+                (subject, f"{_like_escape(subject)}.%"),
             ).fetchall()
         else:
             rows = c.execute(

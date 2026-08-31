@@ -560,3 +560,55 @@ class TestEmbeddingStorage:
 
         assert rows == []
         assert matrix.shape == (0, 0)
+
+
+class TestBeliefNamespaceScoping:
+    """`belief_list_active(subject=...)` has always documented a PREFIX filter.
+
+    The query behind it matched exactly, so every dotted subject was unreachable
+    unless named in full — which is the one thing a namespace exists to avoid.
+    """
+
+    def _seed(self, store):
+        for subject in ("dropweb", "dropweb.media_shutter", "dropweb.dart_via_fvm",
+                        "dropcars", "drop", "user.ui"):
+            store.belief_assert(
+                id=f"b:{subject}",
+                subject=subject,
+                predicate="axiom",
+                object_val=f"rule for {subject}",
+                confidence=0.8,
+                valid_from="2026-01-01T00:00:00+00:00",
+            )
+
+    def test_a_namespace_reaches_its_children(self, store):
+        self._seed(store)
+        got = {r["subject"] for r in store.belief_all_active(subject="dropweb")}
+        assert got == {"dropweb", "dropweb.media_shutter", "dropweb.dart_via_fvm"}
+
+    def test_a_shorter_prefix_does_not_capture_a_sibling(self, store):
+        """`drop` must not swallow `dropweb`: the separator is part of the match."""
+        self._seed(store)
+        got = {r["subject"] for r in store.belief_all_active(subject="drop")}
+        assert got == {"drop"}
+
+    def test_an_exact_leaf_still_resolves_to_itself(self, store):
+        self._seed(store)
+        got = {r["subject"] for r in store.belief_all_active(subject="dropweb.media_shutter")}
+        assert got == {"dropweb.media_shutter"}
+
+    def test_no_subject_returns_every_active_belief(self, store):
+        self._seed(store)
+        assert len(store.belief_all_active()) == 6
+
+    def test_like_metacharacters_in_a_subject_are_literal(self, store):
+        store.belief_assert(
+            id="b:pct", subject="a_b", predicate="axiom", object_val="literal",
+            confidence=0.8, valid_from="2026-01-01T00:00:00+00:00",
+        )
+        store.belief_assert(
+            id="b:other", subject="axb", predicate="axiom", object_val="not this one",
+            confidence=0.8, valid_from="2026-01-01T00:00:00+00:00",
+        )
+        got = {r["subject"] for r in store.belief_all_active(subject="a_b")}
+        assert got == {"a_b"}
