@@ -39,10 +39,15 @@ def hook_socket(srv, monkeypatch):
     monkeypatch.setattr(server, "QUERY_SOCKET", path)
     monkeypatch.setattr(server, "QUERY_SOCKET_RETRY_S", 0.05)
     monkeypatch.setattr(server, "get_encoder", _Encoder)
+    maintainers = []
+    monkeypatch.setattr(server, "_maintain_index", maintainers.append)
     stop = threading.Event()
     threads = []
     yield SimpleNamespace(
-        path=path, lock=lock, start=lambda: threads.append(server._start_query_socket(stop))
+        path=path,
+        lock=lock,
+        maintainers=maintainers,
+        start=lambda: threads.append(server._start_query_socket(stop)),
     )
     stop.set()
     for thread in threads:
@@ -90,6 +95,20 @@ def test_a_waiting_server_takes_over_when_the_owner_dies(hook_socket):
     assert reply is not None
     assert [f["key"] for f in reply["facts"]] == ["takeover_fact"]
 
+
+def test_only_the_owner_maintains_the_index(hook_socket):
+    """The index sync writes for minutes; one writer however many windows."""
+    owner = os.open(hook_socket.lock, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        hook_socket.start()
+        time.sleep(0.3)
+        assert hook_socket.maintainers == []
+    finally:
+        os.close(owner)
+
+    assert _answer(hook_socket.path, "owner now") is not None
+    assert len(hook_socket.maintainers) == 1
 
 
 def test_the_socket_refuses_at_once_until_the_owner_is_warm(hook_socket, monkeypatch):

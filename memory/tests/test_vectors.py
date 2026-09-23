@@ -233,6 +233,27 @@ class TestVectorSearch:
 
         assert len(vectors.vector_search("запрос")) == 2
 
+    def test_a_write_by_another_process_is_seen_without_invalidation(
+        self, vectors, monkeypatch
+    ):
+        """Every window runs a server; the one that syncs the index is rarely
+        the one answering recall."""
+        monkeypatch.setattr(vectors, "VECTOR_CACHE_CHECK_S", 0.0)
+        db.embedding_upsert("fact", "first", [_at_cosine(RELEVANT_FUTURE)],
+                            model=MODEL, dim=DIM)
+        assert len(vectors.vector_search("запрос")) == 1
+
+        db.embedding_upsert("fact", "second", [_at_cosine(RELEVANT_INFLECTION)],
+                            model=MODEL, dim=DIM)
+
+        assert len(vectors.vector_search("запрос")) == 2
+
+    def test_hook_vectors_never_answer_recall(self, vectors):
+        db.embedding_upsert("fact_head", "head_only", [_at_cosine(RELEVANT_FUTURE)],
+                            model=MODEL, dim=DIM)
+
+        assert vectors.vector_search("запрос") == []
+
 
 # ---------------------------------------------------------------------------
 # Backfill: the semantic corpus is the UNION of two disjoint stores
@@ -309,7 +330,7 @@ class TestBackfillSemanticUnion:
         and the rows it already had are not written twice."""
         monkeypatch.setattr(server, "EMBED_MODEL_NAME", MODEL)
         monkeypatch.setattr(
-            server, "embed_chunks", lambda text: [_at_cosine(0.5)] * 2
+            server, "embed_chunks_many", lambda texts: [[_at_cosine(0.5)] * 2 for _ in texts]
         )
         db.semantic_set("f1", "новая запись", {})
 
@@ -321,3 +342,103 @@ class TestBackfillSemanticUnion:
         assert first == (1, 2)
         assert second == (0, 0)
         assert len(rows_after_first) == len(rows_after_second) == 2
+
+
+# ---------------------------------------------------------------------------
+# The living index: the socket owner keeps `embeddings` in step with the store
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def index_env(vectors, tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "NOTES_DIR", tmp_path / "notes")
+    monkeypatch.setattr(server, "CHROMA_SQLITE", tmp_path / "chroma" / "chroma.sqlite3")
+    (tmp_path / "notes").mkdir()
+    monkeypatch.setattr(
+        server, "embed_chunks_many", lambda texts: [[_at_cosine(RELEVANT_FUTURE)] for _ in texts]
+    )
+    return server
+
+
+class TestIndexSync:
+    def test_a_fact_saved_after_the_backfill_becomes_recallable(self, index_env):
+        db.fact_set("saved_later", {"value": "never seen by the one-shot backfill"})
+
+        results = index_env.sync_index()
+
+        assert results["fact"].embedded == 1
+        assert [h[1] for h in index_env.vector_search("запрос", kind="fact")] == ["saved_later"]
+
+    def test_an_unreadable_chroma_leaves_semantic_vectors_alone(self, index_env, tmp_path):
+        broken = tmp_path / "chroma" / "chroma.sqlite3"
+        broken.parent.mkdir()
+        broken.write_bytes(b"not a database")
+        db.embedding_upsert("semantic", "chroma_doc", [_at_cosine(0.5)],
+                            model=MODEL, dim=DIM, src_hash="h")
+
+        results = index_env.sync_index()
+
+        assert "semantic" not in results
+        assert db.embedding_hashes("semantic", MODEL) == {"chroma_doc": "h"}
+
+    def test_the_maintainer_reports_on_stderr_never_stdout(self, srv, monkeypatch, capsys):
+        """stdout is the MCP channel: one stray line there breaks the protocol."""
+        import threading
+
+        import vector_index
+
+        stop = threading.Event()
+
+        def one_pass(pace=None):
+            stop.set()
+            return {"fact": vector_index.Result(embedded=2, chunks=5), "doc": vector_index.Result()}
+
+        monkeypatch.setattr(srv, "sync_index", one_pass)
+        srv._maintain_index(stop)
+
+        out, err = capsys.readouterr()
+        assert out == ""
+        assert err == "[memory] index: fact +2 -0\n"
+
+
+class TestBatchedChunks:
+    def test_records_come_back_apart_whatever_the_batching(self, srv, monkeypatch):
+        calls = []
+
+        class _Encoder:
+            tokenizer = _FakeTokenizer()
+
+            def encode(self, texts, **_kwargs):
+                calls.append(list(texts))
+                return np.array([[float(len(t)), 1.0] for t in texts], dtype=np.float32)
+
+        monkeypatch.setattr(srv, "get_encoder", _Encoder)
+        monkeypatch.setattr(srv, "ENCODE_BATCH", 2)
+
+        out = srv.embed_chunks_many(["a b", "", "ccc", "dd"])
+
+        assert calls == [["a b", "ccc"], ["dd"]]
+        assert [len(v) for v in out] == [1, 0, 1, 1]
+        assert np.frombuffer(out[2][0], dtype="<f4").tolist() == [3.0, 1.0]
+
+
+def test_hook_fact_vectors_survive_a_restart(srv, monkeypatch):
+    """Re-encoding every fact was ~10 s of each ~13 s warm-up."""
+    encoded = []
+
+    class _Encoder:
+        def encode(self, texts, **_kwargs):
+            encoded.extend(texts)
+            return np.array([[1.0, 0.0]] * len(texts), dtype=np.float32)
+
+    monkeypatch.setattr(srv, "get_encoder", _Encoder)
+    db.fact_set("kept_fact", {"value": "v"})
+    assert srv._get_fact_embeddings()["keys"] == ["kept_fact"]
+
+    srv._invalidate_fact_embeddings()  # what a restart loses
+    encoded.clear()
+    cache = srv._get_fact_embeddings()
+
+    assert encoded == []
+    assert cache["keys"] == ["kept_fact"]
+    srv._invalidate_fact_embeddings()

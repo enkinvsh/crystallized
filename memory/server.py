@@ -26,6 +26,7 @@ import os
 import re
 import socket as _socket
 import sqlite3
+import sys
 import threading
 import time
 from datetime import datetime, timedelta
@@ -38,6 +39,7 @@ from sentence_transformers import SentenceTransformer
 from mcp.server.fastmcp import FastMCP
 
 import db
+import vector_index
 import volume
 
 _MEMORY_HOME = Path.home() / ".config" / "opencode" / "memory"
@@ -76,6 +78,11 @@ mcp = FastMCP("opencode-memory")
 _chroma_collection: chromadb.Collection | None = None
 _encoder: SentenceTransformer | None = None
 _encoder_lock = threading.Lock()
+# Held around every USE of the model and its tokenizer. The index sync encodes
+# on a background thread for minutes while hook and tool threads encode too,
+# and neither the MPS backend nor the Rust fast tokenizer ("Already borrowed")
+# tolerates concurrent calls. Reentrant: chunking and encoding nest.
+_encode_lock = threading.RLock()
 
 
 def get_encoder() -> SentenceTransformer:
@@ -989,8 +996,8 @@ def remember(text: str, tags: str = "") -> str:
         _semantic_remember_fallback(doc_id, text, metadata)
         backend = "sqlite-fallback"
     else:
-        encoder = get_encoder()
-        embedding = encoder.encode(text).tolist()
+        with _encode_lock:
+            embedding = get_encoder().encode(text).tolist()
         get_collection().upsert(
             ids=[doc_id],
             embeddings=[embedding],
@@ -1054,8 +1061,8 @@ def search_memory(query: str, n_results: int = 5) -> str:
             )
         return _clip_output(f"Found {len(lines)} memories:\n" + "\n".join(lines))
 
-    encoder = get_encoder()
-    query_embedding = encoder.encode(query).tolist()
+    with _encode_lock:
+        query_embedding = get_encoder().encode(query).tolist()
 
     actual_n = min(n_results, count)
     results = collection.query(
@@ -1382,8 +1389,8 @@ def recall(
                     if mem_lines:
                         sections.append("Semantic memories:\n" + "\n".join(mem_lines))
                 else:
-                    encoder = get_encoder()
-                    query_embedding = encoder.encode(query).tolist()
+                    with _encode_lock:
+                        query_embedding = get_encoder().encode(query).tolist()
                     actual_n = min(n_results, count)
                     results = collection.query(
                         query_embeddings=[query_embedding],
@@ -2292,10 +2299,49 @@ def _chunk_by_tokens(
     if not text:
         return []
     tok = tokenizer if tokenizer is not None else get_encoder().tokenizer
-    encoded = tok(text, add_special_tokens=False, return_offsets_mapping=True)
+    with _encode_lock:
+        encoded = tok(text, add_special_tokens=False, return_offsets_mapping=True)
     offsets = [tuple(o) for o in encoded["offset_mapping"]]
     stride = max(1, CHUNK_TOKENS - CHUNK_OVERLAP_TOKENS)
     return [text[a:b] for a, b in _chunk_spans(offsets, CHUNK_TOKENS, stride)]
+
+
+#: Chunks per forward pass. Measured on this store (MPS): 158 chunks/s at the
+#: library's default of 16 against 281 at 64, and one pass of 64 takes ~0.2 s,
+#: which bounds how long a hook query can wait behind the index sync.
+ENCODE_BATCH = 64
+
+
+def _encode(texts: list[str]) -> np.ndarray:
+    """Normalized float32 vectors, ``ENCODE_BATCH`` texts per locked pass.
+
+    Locked per pass rather than per call: a sync encodes for minutes, and a
+    prompt-hook query must wait for one pass at most, never for all of them.
+    """
+    parts = []
+    for start in range(0, len(texts), ENCODE_BATCH):
+        with _encode_lock:
+            encoded = get_encoder().encode(
+                texts[start : start + ENCODE_BATCH],
+                batch_size=ENCODE_BATCH,
+                show_progress_bar=False,
+                normalize_embeddings=True,
+            )
+        parts.append(np.asarray(encoded, dtype=np.float32))
+    return np.concatenate(parts) if parts else np.zeros((0, 0), dtype=np.float32)
+
+
+def embed_chunks_many(texts: list[str]) -> list[list[bytes]]:
+    """``embed_chunks`` for several records with the batches kept full: every
+    record is chunked first and the flat list encoded, then split back."""
+    chunked = [_chunk_by_tokens(text) for text in texts]
+    matrix = _encode([chunk for chunks in chunked for chunk in chunks])
+    out: list[list[bytes]] = []
+    start = 0
+    for chunks in chunked:
+        out.append([matrix[i].astype("<f4").tobytes() for i in range(start, start + len(chunks))])
+        start += len(chunks)
+    return out
 
 
 def embed_chunks(text: str) -> list[bytes]:
@@ -2305,13 +2351,13 @@ def embed_chunks(text: str) -> list[bytes]:
     second ``SentenceTransformer``: the hook budget assumes exactly one live
     model, inside this process.
     """
-    chunks = _chunk_by_tokens(text)
-    if not chunks:
-        return []
-    matrix = get_encoder().encode(
-        chunks, show_progress_bar=False, normalize_embeddings=True
-    )
-    return [np.asarray(v, dtype="<f4").tobytes() for v in matrix]
+    return embed_chunks_many([text])[0]
+
+
+#: How often ``recall`` looks for writes to the index from anywhere -- the
+#: socket owner's sync, another window, dream, the UI.
+VECTOR_CACHE_CHECK_S = 2.0
+_vector_cache_checked = 0.0
 
 
 def _invalidate_vector_cache() -> None:
@@ -2321,11 +2367,23 @@ def _invalidate_vector_cache() -> None:
 
 
 def _get_vector_cache() -> dict:
-    global _vector_cache
+    """The recall index in memory, reloaded whenever the table has changed.
+
+    The check is one aggregate query, made at most every
+    ``VECTOR_CACHE_CHECK_S``; the reload (~0.6 s for 60k chunks) happens only
+    after a write. It used to load once per process, so a server kept the
+    index it started with for its whole life.
+    """
+    global _vector_cache, _vector_cache_checked
     with _vector_lock:
-        if _vector_cache is None:
-            rows, matrix = db.embedding_load(model=EMBED_MODEL_NAME)
-            _vector_cache = {"rows": rows, "matrix": matrix}
+        now = time.monotonic()
+        if _vector_cache is not None and now - _vector_cache_checked < VECTOR_CACHE_CHECK_S:
+            return _vector_cache
+        _vector_cache_checked = now
+        stamp = db.embedding_stamp(db.EMBEDDING_KINDS, EMBED_MODEL_NAME)
+        if _vector_cache is None or _vector_cache.get("stamp") != stamp:
+            rows, matrix = db.embedding_load(kinds=db.EMBEDDING_KINDS, model=EMBED_MODEL_NAME)
+            _vector_cache = {"rows": rows, "matrix": matrix, "stamp": stamp}
         return _vector_cache
 
 
@@ -2337,7 +2395,8 @@ def embed_query(query: str) -> np.ndarray:
     which 0.6 ms is the matmul, on a 30k-chunk matrix), so encoding per section
     would quadruple the price of the whole call for nothing.
     """
-    q = np.asarray(get_encoder().encode(query), dtype=np.float32)
+    with _encode_lock:
+        q = np.asarray(get_encoder().encode(query), dtype=np.float32)
     norm = float(np.linalg.norm(q))
     return q / norm if norm > 0 else q
 
@@ -2364,10 +2423,9 @@ def vector_search(
     share no vector space, and mixing them returns confident nonsense rather
     than an error.
 
-    CACHE: the matrix is held in-process and rebuilt only when
-    ``_invalidate_vector_cache()`` is called, which every writer of the
-    ``embeddings`` table must do after committing. Nothing here notices a
-    write made by another process.
+    CACHE: the matrix is held in-process and reloaded when the table's stamp
+    moves (see ``_get_vector_cache``), so writes by any process -- above all
+    the socket owner's index sync -- reach every window within seconds.
     """
     cache = _get_vector_cache()
     rows, matrix = cache["rows"], cache["matrix"]
@@ -2513,38 +2571,39 @@ def _fact_text(key: str, value: str) -> str:
     return f"{key}: {value[:300]}"
 
 
-def _build_fact_embeddings(previous: dict | None = None) -> dict | None:
-    """Fact vectors keyed by the facts' ``updated_at`` stamps.
+def _embed_heads(texts: list[str]) -> list[list[bytes]]:
+    """One vector per text, the encoder's own truncation included."""
+    return [[v.astype("<f4").tobytes()] for v in _encode(texts)]
 
-    Every opencode window runs its own server, and each used to keep its
-    cache until one of ITS OWN tools wrote a fact, so facts saved from another
-    window never reached this window's prompt hook. Rebuilding is incremental:
-    only facts whose stamp changed since ``previous`` are re-encoded.
+
+def _build_fact_embeddings(previous: dict | None = None) -> dict | None:
+    """The prompt hook's fact vectors, persisted as kind ``fact_head``.
+
+    One vector per fact over ``_fact_text`` -- exactly what the hook has always
+    scored, so its thresholds keep their meaning. Held in ``embeddings`` so a
+    restart re-encodes only facts whose text changed: encoding all 3.2k was
+    ~10 s of an ~13 s warm-up, measured. Facts written by another window
+    change the fingerprint and arrive the same way.
     """
     try:
         all_facts = db.fact_all()
         if not all_facts:
             return None
-        stamps = {k: p.get("updated_at", "") for k, p in all_facts.items()}
-        old_rows: dict[str, np.ndarray] = {}
-        if previous is not None:
-            for i, key in enumerate(previous["keys"]):
-                if previous["stamps"].get(key) == stamps.get(key):
-                    old_rows[key] = previous["matrix"][i]
-
         keys = list(all_facts)
         values = [str(all_facts[k].get("value", "")) for k in keys]
-        todo = [i for i, k in enumerate(keys) if k not in old_rows]
-        fresh: dict[str, np.ndarray] = {}
-        if todo:
-            encoded = get_encoder().encode(
-                [_fact_text(keys[i], values[i]) for i in todo],
-                show_progress_bar=False,
-                normalize_embeddings=True,
-            )
-            fresh = {keys[i]: encoded[j] for j, i in enumerate(todo)}
-        matrix = np.vstack([old_rows.get(k, fresh.get(k)) for k in keys])
-        return {"keys": keys, "values": values, "matrix": matrix, "stamps": stamps}
+        pairs = [(k, _fact_text(k, v)) for k, v in zip(keys, values, strict=True)]
+        plan = vector_index.plan(vector_index.HOOK_FACT_KIND, pairs, EMBED_MODEL_NAME)
+        vector_index.sync([plan], _embed_heads, EMBED_MODEL_NAME)
+        rows, matrix = db.embedding_load(kind=vector_index.HOOK_FACT_KIND, model=EMBED_MODEL_NAME)
+        row_of = {r["key"]: i for i, r in enumerate(rows)}
+        present = [i for i, k in enumerate(keys) if k in row_of]
+        if not present:
+            return None
+        return {
+            "keys": [keys[i] for i in present],
+            "values": [values[i] for i in present],
+            "matrix": matrix[[row_of[keys[i]] for i in present]],
+        }
     except Exception:
         return previous
 
@@ -2711,10 +2770,10 @@ def _handle_hook_query(conn: _socket.socket):
 
         t0 = time.time()
 
-        encoder = get_encoder()
-        query_embedding = encoder.encode(
-            query, show_progress_bar=False, normalize_embeddings=True
-        )
+        with _encode_lock:
+            query_embedding = get_encoder().encode(
+                query, show_progress_bar=False, normalize_embeddings=True
+            )
 
         facts = _search_facts_semantic(query_embedding, n_facts)
         semantic = _search_semantic_memories(query_embedding, n_semantic, query)
@@ -2735,6 +2794,91 @@ def _handle_hook_query(conn: _socket.socket):
             pass
     finally:
         conn.close()
+
+
+# The recall index is kept current by ONE process, the hook-socket owner, so
+# the table has a single writer however many windows are open. It had one
+# writer ever before this, a backfill run on 2026-08-23: 1208 of 3263 facts,
+# every one saved since, were invisible to recall's meaning search.
+
+INDEX_SYNC_INTERVAL_S = 60.0
+#: After each step, rest for this share of the time the step took: the first
+#: catch-up is minutes of GPU and must leave the machine a third of its time.
+INDEX_SYNC_YIELD = 0.5
+
+
+def _chroma_documents() -> list[tuple[str, str]] | None:
+    """``(id, document)`` straight out of chroma.sqlite3, read-only.
+
+    ``[]`` when there is no Chroma file, ``None`` when there is one that could
+    not be read -- a sync pass then skips the semantic kind instead of deleting
+    the vectors of every document it failed to see. Never via the Chroma API,
+    which segfaults this interpreter.
+    """
+    conn = _sqlite_ro_conn()
+    if conn is None:
+        return []
+    try:
+        cur = conn.execute(
+            "SELECT em.id, em.string_value FROM embedding_metadata em "
+            "WHERE em.key = 'chroma:document' AND em.string_value IS NOT NULL"
+        )
+        return [(str(row[0]), row[1]) for row in cur.fetchall()]
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
+def sync_index(
+    pace: vector_index.Pace | None = None, force: bool = False
+) -> dict[str, vector_index.Result]:
+    """One pass over every recall kind: embed what is missing or changed,
+    drop what is gone. A kind whose source cannot be read is left untouched."""
+    plans = []
+    for kind in db.EMBEDDING_KINDS:
+        pairs = vector_index.sources(
+            kind, notes_dir=NOTES_DIR, chroma_documents=_chroma_documents
+        )
+        if pairs is not None:
+            plans.append(vector_index.plan(kind, pairs, EMBED_MODEL_NAME, force=force))
+    return vector_index.sync(plans, embed_chunks_many, EMBED_MODEL_NAME, pace=pace)
+
+
+def _index_pace(stop: threading.Event) -> vector_index.Pace:
+    mark = time.monotonic()
+
+    def pace(_done: int, _total: int) -> bool:
+        nonlocal mark
+        if stop.wait((time.monotonic() - mark) * INDEX_SYNC_YIELD):
+            return True
+        mark = time.monotonic()
+        return False
+
+    return pace
+
+
+def _maintain_index(stop: threading.Event) -> None:
+    """Sync the index every ``INDEX_SYNC_INTERVAL_S`` until ``stop``.
+
+    A pass over unchanged sources only reads and hashes (~0.4 s). Reports go
+    to stderr, and only when a pass changed something: stdout is the MCP
+    channel.
+    """
+    while not stop.is_set():
+        try:
+            results = sync_index(pace=_index_pace(stop))
+            changed = [
+                f"{kind} +{r.embedded} -{r.deleted}"
+                + (f" ({r.pending} pending)" if r.pending else "")
+                for kind, r in results.items()
+                if r.embedded or r.deleted
+            ]
+            if changed:
+                print("[memory] index: " + ", ".join(changed), file=sys.stderr, flush=True)
+        except Exception as exc:
+            print(f"[memory] index sync failed: {exc!r}", file=sys.stderr, flush=True)
+        stop.wait(INDEX_SYNC_INTERVAL_S)
 
 
 # Every opencode window runs its own server, but the prompt hook talks to ONE
@@ -2765,13 +2909,15 @@ def _claim_query_socket() -> int | None:
 def _warm_hook_path() -> None:
     """Load the model and every fact vector BEFORE the socket exists.
 
-    The hook gives a query 3 s, and a fresh server needs ~11 s for this
-    (measured on 3.2k facts), so a socket bound cold made the first prompt
-    after every restart time out. Until the socket appears the hook's connect
-    fails at once and it falls back without waiting.
+    The hook gives a query 3 s, and a fresh server needed ~11 s for this
+    (measured on 3.2k facts, before the vectors were persisted), so a socket
+    bound cold made the first prompt after every restart time out. Until the
+    socket appears the hook's connect fails at once and it falls back without
+    waiting.
     """
     query = "warm-up"
-    embedding = get_encoder().encode(query, show_progress_bar=False, normalize_embeddings=True)
+    with _encode_lock:
+        embedding = get_encoder().encode(query, show_progress_bar=False, normalize_embeddings=True)
     _search_facts_semantic(embedding, 1)
     _search_semantic_memories(embedding, 1, query)
 
@@ -2793,6 +2939,9 @@ def _serve_query_socket(stop: threading.Event) -> None:
         QUERY_SOCKET.unlink(missing_ok=True)  # a dead owner's; the lock is ours
         sock.bind(str(QUERY_SOCKET))
         sock.listen(5)
+        threading.Thread(
+            target=_maintain_index, args=(stop,), name="memory-index", daemon=True
+        ).start()
         sock.settimeout(1.0)  # accepted connections stay blocking; this only lets `stop` land
         while not stop.is_set():
             try:

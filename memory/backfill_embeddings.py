@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Backfill the `embeddings` table for every layer of the store.
+"""Bring the `embeddings` table up to date now, in the foreground.
 
-Idempotent and resumable: `db.embedding_upsert` replaces all chunks of a key,
-so re-running never duplicates and an interrupted run simply resumes. Pass
-`--force` to re-embed keys that already have vectors (needed after a model
-change); by default they are skipped, which is what makes a resume cheap.
+The running server does this by itself: the hook-socket owner syncs the index
+every minute (`server._maintain_index`). This CLI runs the same pass on demand
+-- after a model change with `--force`, or with no server running. Each key's
+rows carry the hash of the text they came from, so a re-run embeds only what
+is missing or changed and drops what is gone; it never duplicates.
 
 THIS SCRIPT IS THE ONE PLACE OUTSIDE THE SERVER PROCESS PERMITTED TO LOAD THE
 MODEL. It imports `server` and uses `server.get_encoder()`, the same lazy
@@ -32,7 +33,6 @@ caught.
 from __future__ import annotations
 
 import argparse
-import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -43,29 +43,7 @@ if str(_HERE) not in sys.path:
 
 import db  # noqa: E402
 import server  # noqa: E402
-
-
-def _existing_keys(kind: str) -> set[str]:
-    rows, _ = db.embedding_load(kind=kind, model=server.EMBED_MODEL_NAME)
-    return {r["key"] for r in rows}
-
-
-def _chroma_documents() -> list[tuple[str, str]]:
-    """`(id, document)` straight out of chroma.sqlite3, read-only."""
-    conn = server._sqlite_ro_conn()
-    if conn is None:
-        return []
-    try:
-        cur = conn.execute(
-            "SELECT em.id, em.string_value FROM embedding_metadata em "
-            "WHERE em.key = 'chroma:document' AND em.string_value IS NOT NULL"
-        )
-        return [(str(row[0]), row[1]) for row in cur.fetchall()]
-    except sqlite3.Error as exc:
-        print(f"  ! chroma read failed: {exc}")
-        return []
-    finally:
-        conn.close()
+import vector_index  # noqa: E402
 
 
 def _fallback_documents() -> list[tuple[str, str]]:
@@ -79,62 +57,30 @@ def _semantic_union() -> list[tuple[str, str]]:
     The fallback is the newer of the two, so if an id ever appears in both its
     text is the one that reflects the latest write.
     """
-    merged: dict[str, str] = dict(_chroma_documents())
-    merged.update(dict(_fallback_documents()))
-    return sorted(merged.items())
-
-
-def _iter_sources(kind: str) -> list[tuple[str, str]]:
-    if kind == "fact":
-        return [
-            (key, f"{key}: {parsed.get('value', '')}")
-            for key, parsed in db.fact_all().items()
-        ]
-    if kind == "causal":
-        return [
-            (
-                row["id"],
-                " ".join(
-                    p for p in (row["id"], row["text"], row["cause"], row["effect"]) if p
-                ),
-            )
-            for row in db.causal_all(limit=1_000_000)
-        ]
-    if kind == "doc":
-        out: list[tuple[str, str]] = []
-        for path in sorted(server.NOTES_DIR.rglob("*.md")):
-            rel = str(path.relative_to(server.NOTES_DIR).with_suffix(""))
-            out.append((rel, f"{rel}\n{path.read_text(encoding='utf-8')}"))
-        return out
-    if kind == "semantic":
-        return _semantic_union()
-    raise ValueError(f"unknown kind: {kind}")
+    return vector_index.semantic_sources(server._chroma_documents() or [])
 
 
 def backfill(kind: str, force: bool) -> tuple[int, int]:
-    """Embed one layer. Returns ``(records_embedded, chunks_written)``."""
-    sources = _iter_sources(kind)
-    done = set() if force else _existing_keys(kind)
-    todo = [(k, text) for k, text in sources if k not in done and (text or "").strip()]
-
-    print(f"{kind}: {len(sources)} records, {len(sources) - len(todo)} already embedded")
-    records = chunks = 0
+    """Sync one layer. Returns ``(records_embedded, chunks_written)``."""
+    pairs = vector_index.sources(
+        kind, notes_dir=server.NOTES_DIR, chroma_documents=server._chroma_documents
+    )
+    if pairs is None:
+        print(f"{kind}: source unreadable, skipped")
+        return 0, 0
+    plan = vector_index.plan(kind, pairs, server.EMBED_MODEL_NAME, force=force)
+    print(f"{kind}: {len(pairs)} records, {len(plan.todo)} to embed, {len(plan.gone)} gone")
     started = time.perf_counter()
-    for i, (key, text) in enumerate(todo, 1):
-        vectors = server.embed_chunks(text)
-        if not vectors:
-            continue
-        db.embedding_upsert(
-            kind, key, vectors,
-            model=server.EMBED_MODEL_NAME,
-            dim=len(vectors[0]) // 4,
-        )
-        records += 1
-        chunks += len(vectors)
-        if i % 50 == 0 or i == len(todo):
-            rate = i / max(1e-9, time.perf_counter() - started)
-            print(f"  {kind}: {i}/{len(todo)} records, {chunks} chunks, {rate:.0f} rec/s")
-    return records, chunks
+
+    def progress(done: int, total: int) -> bool:
+        rate = done / max(1e-9, time.perf_counter() - started)
+        print(f"  {kind}: {done}/{total} records, {rate:.0f} rec/s")
+        return False
+
+    result = vector_index.sync(
+        [plan], server.embed_chunks_many, server.EMBED_MODEL_NAME, pace=progress
+    )[kind]
+    return result.embedded, result.chunks
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -151,7 +97,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"model: {server.EMBED_MODEL_NAME}")
     print(f"store: {db.DB_PATH}")
-    chroma = _chroma_documents()
+    chroma = server._chroma_documents() or []
     fallback = _fallback_documents()
     union = _semantic_union()
     print(
