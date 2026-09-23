@@ -18,6 +18,7 @@ Internal Query Socket:
 
 import contextlib
 import difflib
+import fcntl
 import hashlib
 import json
 import math  # noqa: F401 — used in volume decay
@@ -74,6 +75,7 @@ mcp = FastMCP("opencode-memory")
 
 _chroma_collection: chromadb.Collection | None = None
 _encoder: SentenceTransformer | None = None
+_encoder_lock = threading.Lock()
 
 
 def get_encoder() -> SentenceTransformer:
@@ -88,13 +90,18 @@ def get_encoder() -> SentenceTransformer:
     which would be a hard failure on a machine that has never downloaded the
     model — and an env var would silently change behaviour for every other
     library in the process too.
+
+    Locked because the socket warm-up, hook queries and tool calls can all ask
+    before the model is loaded, and two concurrent loads hold two models.
     """
     global _encoder
     if _encoder is None:
-        try:
-            _encoder = SentenceTransformer(EMBED_MODEL_NAME, local_files_only=True)
-        except Exception:
-            _encoder = SentenceTransformer(EMBED_MODEL_NAME)
+        with _encoder_lock:
+            if _encoder is None:
+                try:
+                    _encoder = SentenceTransformer(EMBED_MODEL_NAME, local_files_only=True)
+                except Exception:
+                    _encoder = SentenceTransformer(EMBED_MODEL_NAME)
     return _encoder
 
 
@@ -2730,38 +2737,90 @@ def _handle_hook_query(conn: _socket.socket):
         conn.close()
 
 
-def _start_query_socket():
-    try:
-        if QUERY_SOCKET.exists():
-            # Probe BEFORE unlinking: never steal a socket that is alive.
-            test_sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-            test_sock.settimeout(0.2)
-            try:
-                test_sock.connect(str(QUERY_SOCKET))
-                return  # another process is actively serving
-            except (OSError, TimeoutError):
-                QUERY_SOCKET.unlink(missing_ok=True)
-            finally:
-                test_sock.close()
+# Every opencode window runs its own server, but the prompt hook talks to ONE
+# socket. An exclusive flock on the file next to it decides who binds: the
+# kernel drops the lock however the holder dies, so a dead owner's socket file
+# never blocks a successor, and the other servers poll the lock to take over
+# when the owning window closes instead of leaving the hook dark until restart.
 
-        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+QUERY_SOCKET_RETRY_S = 15.0
+
+
+def _query_lock_path() -> Path:
+    return QUERY_SOCKET.with_name(QUERY_SOCKET.name + ".lock")
+
+
+def _claim_query_socket() -> int | None:
+    """The lock fd to keep open for the life of the process, or None while
+    another live server holds it."""
+    fd = os.open(_query_lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _warm_hook_path() -> None:
+    """Load the model and every fact vector BEFORE the socket exists.
+
+    The hook gives a query 3 s, and a fresh server needs ~11 s for this
+    (measured on 3.2k facts), so a socket bound cold made the first prompt
+    after every restart time out. Until the socket appears the hook's connect
+    fails at once and it falls back without waiting.
+    """
+    query = "warm-up"
+    embedding = get_encoder().encode(query, show_progress_bar=False, normalize_embeddings=True)
+    _search_facts_semantic(embedding, 1)
+    _search_semantic_memories(embedding, 1, query)
+
+
+def _serve_query_socket(stop: threading.Event) -> None:
+    lock_fd = None
+    while lock_fd is None:
+        if stop.is_set():
+            return
+        with contextlib.suppress(OSError):
+            lock_fd = _claim_query_socket()
+        if lock_fd is None:
+            stop.wait(QUERY_SOCKET_RETRY_S)
+
+    with contextlib.suppress(Exception):
+        _warm_hook_path()
+    sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    try:
+        QUERY_SOCKET.unlink(missing_ok=True)  # a dead owner's; the lock is ours
         sock.bind(str(QUERY_SOCKET))
         sock.listen(5)
+        sock.settimeout(1.0)  # accepted connections stay blocking; this only lets `stop` land
+        while not stop.is_set():
+            try:
+                conn, _ = sock.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                stop.wait(0.1)
+                continue
+            threading.Thread(target=_handle_hook_query, args=(conn,), daemon=True).start()
+    finally:
+        sock.close()
+        # A server that cannot bind keeps the lock: the others would only
+        # line up to fail the same way. Stepping down is what `stop` is for.
+        if stop.is_set():
+            QUERY_SOCKET.unlink(missing_ok=True)
+            os.close(lock_fd)
 
-        def serve():
-            while True:
-                try:
-                    conn, _ = sock.accept()
-                    threading.Thread(
-                        target=_handle_hook_query, args=(conn,), daemon=True
-                    ).start()
-                except Exception:
-                    continue
 
-        thread = threading.Thread(target=serve, daemon=True)
-        thread.start()
-    except Exception:
-        pass
+def _start_query_socket(stop: threading.Event | None = None) -> threading.Thread:
+    thread = threading.Thread(
+        target=_serve_query_socket,
+        args=(stop if stop is not None else threading.Event(),),
+        name="memory-query-socket",
+        daemon=True,
+    )
+    thread.start()
+    return thread
 
 
 # ===================================================================
