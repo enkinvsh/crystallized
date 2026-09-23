@@ -13,6 +13,7 @@ Output format: [OwnVoice] block injected before the prompt.
 """
 
 import os
+import re
 from pathlib import Path
 
 NOTES_DIR = Path(
@@ -23,6 +24,8 @@ NOTES_DIR = Path(
 )
 SELF_DIR = NOTES_DIR / "self"
 JOURNAL_DIR = NOTES_DIR / "journal"
+
+_JOURNAL_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}.*\.md$")
 
 
 def read_soul() -> str:
@@ -43,11 +46,15 @@ def get_open_question() -> str | None:
     if not JOURNAL_DIR.exists():
         return None
 
-    entries = sorted(JOURNAL_DIR.glob("*.md"), reverse=True)
+    entries = [
+        f for f in JOURNAL_DIR.glob("*.md")
+        if _JOURNAL_PATTERN.match(f.name)
+    ]
     if not entries:
         return None
 
-    content = entries[0].read_text()
+    latest_entry = max(entries, key=lambda f: f.name)
+    content = latest_entry.read_text()
     lines = content.splitlines()
 
     for i, line in enumerate(lines):
@@ -106,11 +113,15 @@ def main():
     if focus:
         parts.append(f"Focus: {focus}")
 
+    watchlist = read_watchlist()
+
+    if not parts and not watchlist:
+        return
+
     question = get_open_question()
     if question:
         parts.append(f"Open question: {question}")
 
-    watchlist = read_watchlist()
     if watchlist:
         parts.append(f"Watchlist: {', '.join(watchlist)}")
 

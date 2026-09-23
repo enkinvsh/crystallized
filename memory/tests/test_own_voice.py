@@ -85,3 +85,51 @@ def test_own_voice_emits_block_when_beliefs_exist(tmp_path):
         f"expected [OwnVoice] block or 'Sisyphus' content in stdout; "
         f"got stdout={result.stdout!r}"
     )
+
+
+def test_own_voice_journal_selection_ignores_templates(tmp_path):
+    """beliefs present, journal = {README.md, _template.md, 2026-01-01-a.md, 2026-02-01-b.md}
+    -> the question comes from 2026-02-01-b.md."""
+    notes_dir = tmp_path / "notes"
+    self_dir = notes_dir / "self"
+    self_dir.mkdir(parents=True, exist_ok=True)
+    (self_dir / "beliefs.md").write_text("I am Sisyphus.")
+
+    journal_dir = notes_dir / "journal"
+    journal_dir.mkdir(parents=True, exist_ok=True)
+    (journal_dir / "README.md").write_text("What is this README doing here?")
+    (journal_dir / "_template.md").write_text("## Open question\nWhat I do not yet know?")
+    (journal_dir / "2026-01-01-a.md").write_text("## Open question\nIs 2026-01-01 the question?")
+    (journal_dir / "2026-02-01-b.md").write_text("## Open question\nIs 2026-02-01 the right question?")
+
+    result = subprocess.run(
+        [sys.executable, str(HOOK)],
+        input="{}",
+        capture_output=True,
+        text=True,
+        env=_hook_env(tmp_path, notes_dir),
+        timeout=5,
+    )
+    assert result.returncode == 0
+    assert "Is 2026-02-01 the right question?" in result.stdout
+    assert "What I do not yet know" not in result.stdout
+
+
+def test_own_voice_silent_without_persona(tmp_path):
+    """No self dir, journal present -> empty output, exit 0."""
+    notes_dir = tmp_path / "notes"
+    journal_dir = notes_dir / "journal"
+    journal_dir.mkdir(parents=True, exist_ok=True)
+    (journal_dir / "2026-02-01-b.md").write_text("## Open question\nIs anyone listening?")
+
+    result = subprocess.run(
+        [sys.executable, str(HOOK)],
+        input="{}",
+        capture_output=True,
+        text=True,
+        env=_hook_env(tmp_path, notes_dir),
+        timeout=5,
+    )
+    assert result.returncode == 0
+    assert result.stdout.strip() == ""
+

@@ -45,6 +45,8 @@ Crystallized becomes a self-contained, self-evolving memory engine. The Redis de
 
 ### Fixed
 
+- **`own-voice.py` now filters journal files to dated filenames (`YYYY-MM-DD*.md`)**, preventing `_template.md` and non-journal files from being chosen as open questions.
+- **`own-voice.py` remains completely silent when no persona (`self/`) content exists**, avoiding injecting orphan prompts when persona content is not loaded.
 - **`uninstall.sh` now removes the SQLite database completely**, including the `memory.db-wal` and `memory.db-shm` siblings. Deleting `memory.db` alone left a write-ahead log that a later install would replay.
 - `uninstall.sh` now unloads and deletes the launchd agent, or removes the marked cron entry, instead of leaving a scheduled job pointing at deleted files.
 - `uninstall.sh` now unregisters Crystallized hooks from `~/.claude/settings.json`, identifying them by path and leaving every foreign hook and every foreign key untouched. Events left empty are pruned.
