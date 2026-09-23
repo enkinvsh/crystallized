@@ -794,6 +794,62 @@ def pass5_forget(l0_ttl_days: int = DEFAULT_L0_TTL_DAYS, dry_run: bool = False) 
     return db.causal_delete_l0_reapable(l0_ttl_days, dry_run=dry_run)
 
 
+def link_textual_supersessions(dry_run: bool = False) -> list[tuple[str, str]]:
+    """Link facts whose text retracts an older fact («ОТМЕНЯЕТ <key>» etc.).
+
+    Corrections were always written as prose, so the store never knew about
+    them and kept ranking the retracted claim by its recall count. This pass
+    turns that prose into ``superseded_by`` links for facts written before
+    save_fact learned to parse it (and for anything saved around it).
+
+    The target mapping is computed first and applied second, so the pass is
+    idempotent: a fact retracted by several newer facts points at the newest
+    one, an existing link to a newer fact is kept, and a re-run changes
+    nothing. Returns the (old, new) pairs that changed, or would change.
+    """
+    with db.read_conn() as c:
+        rows = c.execute(
+            "SELECT key, value, updated_at, superseded_by FROM facts "
+            "ORDER BY updated_at ASC, key ASC"
+        ).fetchall()
+
+    all_keys = {row["key"] for row in rows}
+    updated = {row["key"]: row["updated_at"] or "" for row in rows}
+    current: dict[str, str | None] = {row["key"]: row["superseded_by"] for row in rows}
+    desired = dict(current)
+
+    def _creates_cycle(old: str, new: str) -> bool:
+        seen: set[str] = set()
+        node: str | None = new
+        while node and node not in seen:
+            if node == old:
+                return True
+            seen.add(node)
+            node = desired.get(node)
+        return False
+
+    for row in rows:
+        new = row["key"]
+        for old in db.find_superseded_keys(new, row["value"] or "", all_keys):
+            target = desired.get(old)
+            if target is not None and updated.get(target, "") >= updated[new]:
+                continue  # already points at this fact or at a newer one
+            if _creates_cycle(old, new):
+                continue
+            desired[old] = new
+
+    changed = [
+        (old, new)
+        for old, new in desired.items()
+        if new is not None and new != current.get(old)
+    ]
+    if not dry_run:
+        for old, new in changed:
+            db.fact_supersede(old, new)
+            volume.demote_superseded(old, new)
+    return changed
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
@@ -880,6 +936,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Consolidate now, ignoring the quiet window and the once-a-day cap.",
     )
+    parser.add_argument(
+        "--link-supersessions",
+        action="store_true",
+        help="Scan facts for textual supersession cues and link them.",
+    )
     return parser
 
 
@@ -889,6 +950,24 @@ def main(argv: list[str] | None = None) -> int:
         db.set_db_path(args.db)
     else:
         db.init_schema()
+
+    if args.link_supersessions:
+        with single_writer(blocking=args.wait):
+            pairs = link_textual_supersessions(dry_run=args.dry_run)
+        distinct_old = len({old for old, _ in pairs})
+        if args.json:
+            print(json.dumps({
+                "dry_run": args.dry_run,
+                "pairs_count": len(pairs),
+                "distinct_old_keys": distinct_old,
+                "pairs": pairs,
+            }))
+        else:
+            prefix = "[dry-run] " if args.dry_run else ""
+            print(f"{prefix}Pairs found: {len(pairs)}, distinct old keys: {distinct_old}")
+            for old, new in pairs[:20]:
+                print(f"  {old} <- {new}")
+        return 0
 
     # A dry run writes nothing, so it cannot skew the ladder and is never gated.
     gated = not (args.force or args.dry_run)

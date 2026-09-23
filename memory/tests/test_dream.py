@@ -1566,3 +1566,46 @@ class TestLaunchdTemplate:
     def test_paths_are_installer_templated(self, plist):
         assert plist["WorkingDirectory"] == "MEMORY_PATH"
         assert all(a.startswith(("MEMORY_PATH", "--")) for a in plist["ProgramArguments"])
+
+
+class TestLinkTextualSupersessions:
+    def test_link_textual_supersessions_and_dry_run(self, temp_db):
+        db.fact_set("fact_old_12345", {"value": "initial claim", "updated_at": "2026-01-01T00:00:00"})
+        db.fact_set("fact_new_67890", {"value": "ОТМЕНЯЕТ fact_old_12345 полностью", "updated_at": "2026-01-02T00:00:00"})
+
+        # Dry run
+        pairs = dream.link_textual_supersessions(dry_run=True)
+        assert pairs == [("fact_old_12345", "fact_new_67890")]
+        assert "superseded_by" not in (db.fact_get("fact_old_12345") or {})
+
+        # Real run
+        pairs_real = dream.link_textual_supersessions(dry_run=False)
+        assert pairs_real == [("fact_old_12345", "fact_new_67890")]
+        assert db.fact_get("fact_old_12345")["superseded_by"] == "fact_new_67890"
+
+        # Re-run is no-op
+        assert dream.link_textual_supersessions(dry_run=False) == []
+
+    def test_link_textual_supersessions_newest_correction_wins_and_rerun_is_noop(self, temp_db):
+        db.fact_set("fact_claim_0001", {"value": "claim", "updated_at": "2026-01-01T00:00:00"})
+        db.fact_set("fact_fix_one_0002", {"value": "ОТМЕНЯЕТ fact_claim_0001", "updated_at": "2026-01-02T00:00:00"})
+        db.fact_set("fact_fix_two_0003", {"value": "SUPERSEDES fact_claim_0001", "updated_at": "2026-01-03T00:00:00"})
+
+        assert dream.link_textual_supersessions(dry_run=True) == [("fact_claim_0001", "fact_fix_two_0003")]
+        assert dream.link_textual_supersessions() == [("fact_claim_0001", "fact_fix_two_0003")]
+        assert db.fact_get("fact_claim_0001")["superseded_by"] == "fact_fix_two_0003"
+        # A re-run must neither flip the pointer back nor report anything.
+        assert dream.link_textual_supersessions(dry_run=True) == []
+        assert dream.link_textual_supersessions() == []
+
+    def test_link_supersessions_cli_flag(self, temp_db, capsys):
+        db.fact_set("fact_old_12345", {"value": "initial claim", "updated_at": "2026-01-01T00:00:00"})
+        db.fact_set("fact_new_67890", {"value": "ОТМЕНЯЕТ fact_old_12345 полностью", "updated_at": "2026-01-02T00:00:00"})
+
+        rc = dream.main(["--link-supersessions", "--dry-run", "--db", str(temp_db)])
+        assert rc == 0
+        captured = capsys.readouterr().out
+        assert "Pairs found: 1" in captured or "Pairs: 1" in captured or "pairs: 1" in captured.lower()
+        assert "fact_old_12345" in captured
+        assert "fact_new_67890" in captured
+
