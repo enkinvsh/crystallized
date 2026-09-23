@@ -76,6 +76,25 @@ def test_hook_runs_without_socket(tmp_path):
     assert "[Clock]" in result.stdout or "[Memory]" in result.stdout or result.stdout.strip() == ""
 
 
+def test_socket_down_injects_only_the_clock_and_one_hint(store, tmp_path):
+    """A server that is starting or gone must not turn into a keyword dump:
+    the first prompt after a restart used to get 12 loosely matching facts."""
+    store.fact_set("dark_mode_decision", {"value": "Oen prefers dark mode everywhere"})
+    store.volume_set("fact:dark_mode_decision", "fact", 95.0)
+    env = {
+        **os.environ,
+        "OPENCODE_MEMORY_DB": str(tmp_path / "memory.db"),
+        "OPENCODE_MEMORY_SOCKET": "/tmp/nonexistent-socket-xyz.sock",
+    }
+    result = _run_hook(env, "what does Oen think of dark mode")
+    assert result.returncode == 0
+    lines = result.stdout.splitlines()
+    assert lines[0].startswith("[Clock] ")
+    assert len(lines) == 2
+    assert lines[1].startswith("[Memory] Semantic search unavailable")
+    assert "dark_mode_decision" not in result.stdout
+
+
 def test_hook_handles_empty_prompt(tmp_path):
     notes_dir = tmp_path / "notes"
     notes_dir.mkdir(parents=True, exist_ok=True)
@@ -98,27 +117,12 @@ def test_hook_handles_empty_prompt(tmp_path):
 
 
 class TestDocSection:
-    def test_docs_are_summarized_not_enumerated(self, tmp_path):
+    def test_docs_are_not_injected_on_every_turn(self, tmp_path):
         env = _populated_env(tmp_path)
         result = _run_hook(env, "what did we decide about dark mode")
         assert result.returncode == 0
-        doc_lines = [ln for ln in result.stdout.splitlines() if "Docs" in ln]
-        assert len(doc_lines) == 1
-        assert "1040" in doc_lines[0] and "130" in doc_lines[0]
+        assert "Docs" not in result.stdout
         assert "folder000" not in result.stdout
-
-    def test_doc_stats_count_without_listing(self, tmp_path, monkeypatch):
-        notes = tmp_path / "notes"
-        (notes / "architecture").mkdir(parents=True)
-        (notes / "architecture" / "a.md").write_text("x", "utf-8")
-        (notes / "architecture" / "b.md").write_text("x", "utf-8")
-        (notes / "empty").mkdir(parents=True)
-        monkeypatch.setattr(inject, "NOTES_DIR", notes)
-        assert inject.get_doc_stats() == (1, 2)
-
-    def test_missing_notes_dir_is_not_fatal(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(inject, "NOTES_DIR", tmp_path / "notes")
-        assert inject.get_doc_stats() == (0, 0)
 
 
 class TestTokenBudget:
