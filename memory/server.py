@@ -484,6 +484,18 @@ def _clip_output(text: str, max_bytes: int = 45000) -> str:
     return clipped + marker
 
 
+def _cap_chars(text: str, limit: int, marker: str) -> str:
+    """Cap `text` at `limit` chars (marker included), cutting at the last
+    newline before the limit so no rendered line is split."""
+    if len(text) <= limit:
+        return text
+    budget = max(0, limit - len(marker))
+    cut = text.rfind("\n", 0, budget + 1)
+    if cut <= 0:
+        cut = budget
+    return text[:cut] + marker
+
+
 # ---------------------------------------------------------------------------
 # Cyrillic word detection (cross-lingual embedding gap mitigation)
 # ---------------------------------------------------------------------------
@@ -629,7 +641,9 @@ def _get_ttl_days(key: str) -> int:
 
 
 @mcp.tool()
-def save_fact(key: str, value: str, ttl_days: int | None = None) -> str:
+def save_fact(
+    key: str, value: str, ttl_days: int | None = None, supersedes: str = ""
+) -> str:
     """Save a quick fact (user name, project name, tech stack choice, key decision).
     Facts persist across sessions and are instantly retrievable by key.
 
@@ -637,7 +651,18 @@ def save_fact(key: str, value: str, ttl_days: int | None = None) -> str:
         key: Short descriptive key like "user_name", "db_choice", "project_lang"
         value: The fact value
         ttl_days: Optional TTL in days. Auto-detected from key pattern if not provided.
+        supersedes: Optional comma-separated list of fact keys that this new fact supersedes.
+            Facts can also be superseded textually by writing an active correction verb
+            (e.g., «ОТМЕНЯЕТ <key>», «SUPERSEDES <key>») in the fact value.
+
+    Hard limit: value <= 3000 chars; long reports go to save_doc.
     """
+    if len(value) > FACT_MAX_CHARS:
+        return (
+            f"REJECTED (not saved): fact value is {len(value)} chars, limit {FACT_MAX_CHARS}. "
+            "Rewrite it shorter: outcome, key paths/commands/IDs, rollback. "
+            "Put long details into save_doc(folder, name, content) and reference that doc from the fact."
+        )
     existing = db.fact_get(key)
     contradiction_msg = ""
 
@@ -668,10 +693,73 @@ def save_fact(key: str, value: str, ttl_days: int | None = None) -> str:
         else:
             _log_memory_event(key, "update", existing_vol, "fact", conn=txn)
     _invalidate_fact_embeddings()
-    return f"Saved fact: {key} = {value} (TTL: {effective_ttl}d){contradiction_msg}"
+
+    explicit_raw = [k.strip() for k in supersedes.split(",") if k.strip()]
+    explicit_keys: list[str] = []
+    for k in explicit_raw:
+        if k not in explicit_keys:
+            explicit_keys.append(k)
+
+    textual_keys = db.find_superseded_keys(key, value, set(db.fact_keys()))
+
+    superseded_applied: list[str] = []
+    superseded_skipped: list[str] = []
+
+    for old_k in explicit_keys:
+        try:
+            db.fact_supersede(old_k, key)
+            volume.demote_superseded(old_k, key)
+            superseded_applied.append(old_k)
+        except ValueError as err:
+            superseded_skipped.append(f"{old_k} ({err})")
+
+    for old_k in textual_keys:
+        if old_k in superseded_applied:
+            continue
+        try:
+            db.fact_supersede(old_k, key)
+            volume.demote_superseded(old_k, key)
+            superseded_applied.append(old_k)
+        except ValueError:
+            pass
+
+    supersedes_msg = ""
+    if superseded_applied:
+        supersedes_msg += f"\nSupersedes: {', '.join(superseded_applied)}"
+    if superseded_skipped:
+        supersedes_msg += f"\nSupersede skipped: {', '.join(superseded_skipped)}"
+
+    return f"Saved fact: {key} ({len(value)} chars, TTL: {effective_ttl}d){contradiction_msg}{supersedes_msg}"
+
+
+@mcp.tool()
+def supersede_fact(old_key: str, new_key: str = "") -> str:
+    """Link an old fact as superseded by a newer fact, or clear the link if new_key is empty.
+
+    When linking, the old fact is capped below the new one (at most
+    volume.SUPERSEDED_VOLUME_RATIO of its effective volume) and stops gaining
+    volume on recall. Clearing the link does NOT restore the old fact's volume.
+
+    Args:
+        old_key: The fact key being superseded.
+        new_key: The replacement fact key, or empty string to unlink.
+    """
+    try:
+        target = new_key if new_key else None
+        db.fact_supersede(old_key, target)
+        if target:
+            demoted_vol = volume.demote_superseded(old_key, target)
+            return (
+                f"Fact {old_key!r} superseded by {target!r}. "
+                f"Effective volume demoted to {demoted_vol:.1f}."
+            )
+        return f"Supersession link cleared for {old_key!r}."
+    except ValueError as err:
+        return f"Error: {err}"
 
 
 FACT_CHUNK_CHARS = 20000
+FACT_MAX_CHARS = 3000
 
 
 def _fact_freshness(parsed: dict) -> str:
@@ -685,15 +773,23 @@ def _fact_freshness(parsed: dict) -> str:
 
 
 def _get_fact_header(key: str, parsed: dict, eff_vol: float, stored: float) -> str:
-    return (
-        f"Fact: {key}\n"
-        f"Group: {_fact_group(key)}\n"
-        f"Updated: {parsed.get('updated_at', '')}\n"
-        f"Freshness: {_fact_freshness(parsed)}\n"
-        f"Volume: {eff_vol:.1f} effective / {stored:.1f} stored\n"
-        f"TTL: {parsed.get('ttl_days', '?')}d · "
-        f"Last reinforced: {parsed.get('last_reinforced_at', '')}"
-    )
+    lines = [
+        f"Fact: {key}",
+        f"Group: {_fact_group(key)}",
+        f"Updated: {parsed.get('updated_at', '')}",
+        f"Freshness: {_fact_freshness(parsed)}",
+        f"Volume: {eff_vol:.1f} effective / {stored:.1f} stored",
+        f"TTL: {parsed.get('ttl_days', '?')}d · Last reinforced: {parsed.get('last_reinforced_at', '')}",
+    ]
+    superseded_by = parsed.get("superseded_by")
+    if superseded_by:
+        lines.append(
+            f"Superseded by: {superseded_by} — it overrides this fact in whole or in part; read it first."
+        )
+        head = db.fact_supersession_head(key)
+        if head and head != superseded_by:
+            lines.append(f"Latest in chain: {head}")
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -732,7 +828,8 @@ def list_facts(prefix: str = "", limit: int = 50, full: bool = False) -> str:
         fresh = "expired" if f["expired"] else "fresh"
         date = f["updated_at"][:10] or "unknown"
         body = f["val"] if full else _preview(f["val"], 200, f["key"])
-        if not builder.add(f"  {date} · vol {f['vol']:.1f} · {fresh}\n    {f['key']}: {body}"):
+        sup_str = f" [superseded by {f['superseded_by']}]" if f.get("superseded_by") else ""
+        if not builder.add(f"  {date} · vol {f['vol']:.1f} · {fresh}\n    {f['key']}{sup_str}: {body}"):
             break
 
     shown = len(builder.lines)
@@ -801,7 +898,9 @@ def get_fact(key: str, offset: int = 0) -> str:
     eff_vol = _effective_volume("fact", key, last_reinf)
     stored = _get_volume("fact", key)
 
-    if offset == 0:
+    # A superseded fact is frozen: no boost (volume.reinforce) and no clock
+    # reset either, since restarting its decay clock would lift it just the same.
+    if offset == 0 and not parsed.get("superseded_by"):
         _reinforce("fact", key, quality=0.75, last_reinforced_at=last_reinf)
         parsed["last_reinforced_at"] = datetime.now().isoformat()
         try:
@@ -1118,6 +1217,19 @@ def delete_doc(folder: str, name: str) -> str:
 # ===================================================================
 
 
+RECALL_FACT_PREVIEW = 220
+RECALL_SEMANTIC_PREVIEW = 260
+RECALL_CAUSAL_PREVIEW = 220
+RECALL_DOC_PREVIEW = 140
+RECALL_BELIEF_PREVIEW = 160
+RECALL_MAX_CHARS = 8000
+RECALL_FACT_VECTOR_TOPUP = 2
+RECALL_SEMANTIC_VECTOR_TOPUP = 2
+RECALL_CAUSAL_MAX_LINES = 3
+RECALL_DOC_MAX_LINES = 3
+RECALL_BELIEF_MAX_LINES = 3
+
+
 @mcp.tool()
 def recall(
     query: str, n_results: int = 5, min_score: float = VECTOR_MIN_SCORE
@@ -1146,6 +1258,11 @@ def recall(
     shown: dict[str, set[str]] = {k: set() for k in db.EMBEDDING_KINDS}
     query_lower = query.lower()
     query_cf = query.casefold()
+    # Reinforcement is deferred until the output is capped, so only items
+    # whose line actually reaches the caller gain volume.
+    pending_facts: list[tuple[str, dict]] = []
+    # (line, doc_id, last_reinforced_at, chroma meta, chroma collection)
+    pending_semantic: list[tuple[str, str, str | None, dict | None, object]] = []
 
     try:
         all_facts: dict[str, dict] = db.fact_all()
@@ -1177,6 +1294,7 @@ def recall(
                     "expired": bool(exp_dt and now > exp_dt),
                     "updated_at": parsed.get("updated_at", ""),
                     "last_reinf": parsed.get("last_reinforced_at"),
+                    "superseded_by": parsed.get("superseded_by"),
                 }
             )
             keys_for_vol.append(k)
@@ -1188,6 +1306,7 @@ def recall(
                 c["vol"] = vol
             candidates.sort(
                 key=lambda c: (
+                    0 if c["superseded_by"] else 1,
                     1 if c["exact"] else 0,
                     1 if c["key_sub"] else 0,
                     1 if c["val_sub"] else 0,
@@ -1200,30 +1319,15 @@ def recall(
                 reverse=True,
             )
             selected = candidates[:n_results]
-            lines_facts = [
-                f"  {c['key']}: {_preview(c['val'], 400, c['key'])} (vol: {c['vol']:.1f})"
-                for c in selected
-            ]
-            # ONE transaction for the whole reinforcement pass: without it this
-            # loop issues ~3 writes per selected fact (volume + event + row).
-            with db.write_txn() as txn:
-                for c in selected:
-                    _reinforce(
-                        "fact",
-                        c["key"],
-                        quality=0.5,
-                        last_reinforced_at=c["last_reinf"],
-                        conn=txn,
-                    )
-                    # db.fact_all() handed out ONE dict per key and the
-                    # candidate rows above still reference it. Re-fetch a
-                    # FRESH dict before mutating so the candidate entry (and
-                    # the rendered lines) cannot be corrupted by this write.
-                    fresh = db.fact_get(c["key"])
-                    if fresh is None:
-                        continue
-                    fresh["last_reinforced_at"] = datetime.now().isoformat()
-                    db.fact_set(c["key"], fresh, conn=txn)
+            lines_facts = []
+            for c in selected:
+                sup_str = f" [superseded by {c['superseded_by']}]" if c.get("superseded_by") else ""
+                line = (
+                    f"  {c['key']}{sup_str}: "
+                    f"{_preview(c['val'], RECALL_FACT_PREVIEW, c['key'])} (vol: {c['vol']:.1f})"
+                )
+                lines_facts.append(line)
+                pending_facts.append((line, c))
             shown["fact"].update(c["key"] for c in selected)
             sections.append("Facts:\n" + "\n".join(lines_facts))
     except Exception:
@@ -1235,14 +1339,16 @@ def recall(
             mem_lines = []
             for doc, meta, eff_vol, doc_id in matches:
                 lr = meta.get("last_reinforced_at") if meta else None
-                _reinforce("semantic", doc_id, quality=0.5, last_reinforced_at=lr)
                 date = meta.get("date", "unknown") if meta else "unknown"
                 tags = meta.get("tags", "") if meta else ""
                 tag_str = f" [{tags}]" if tags else ""
                 shown["semantic"].add(doc_id)
-                mem_lines.append(
-                    f"  [substr] id={doc_id} ({date}){tag_str} (vol: {eff_vol:.1f}) {_preview(doc, 600)}"
+                line = (
+                    f"  [substr] id={doc_id} ({date}){tag_str} (vol: {eff_vol:.1f}) "
+                    f"{_preview(doc, RECALL_SEMANTIC_PREVIEW)}"
                 )
+                mem_lines.append(line)
+                pending_semantic.append((line, doc_id, lr, None, None))
             if mem_lines:
                 sections.append("Semantic memories:\n" + "\n".join(mem_lines))
         else:
@@ -1256,19 +1362,16 @@ def recall(
                     mem_lines = []
                     for doc, meta, eff_vol, doc_id in matches:
                         lr = meta.get("last_reinforced_at") if meta else None
-                        _reinforce("semantic", doc_id, quality=0.5, last_reinforced_at=lr)
-                        meta["last_reinforced_at"] = datetime.now().isoformat()
-                        try:
-                            collection.update(ids=[doc_id], metadatas=[meta])
-                        except Exception:
-                            pass
                         date = meta.get("date", "unknown") if meta else "unknown"
                         tags = meta.get("tags", "") if meta else ""
                         tag_str = f" [{tags}]" if tags else ""
                         shown["semantic"].add(doc_id)
-                        mem_lines.append(
-                            f"  [substr] id={doc_id} ({date}){tag_str} (vol: {eff_vol:.1f}) {_preview(doc, 600)}"
+                        line = (
+                            f"  [substr] id={doc_id} ({date}){tag_str} (vol: {eff_vol:.1f}) "
+                            f"{_preview(doc, RECALL_SEMANTIC_PREVIEW)}"
                         )
+                        mem_lines.append(line)
+                        pending_semantic.append((line, doc_id, lr, meta, collection))
                     if mem_lines:
                         sections.append("Semantic memories:\n" + "\n".join(mem_lines))
                 else:
@@ -1295,22 +1398,17 @@ def recall(
                             doc_id = results["ids"][0][i]
                             lr_prev = meta.get("last_reinforced_at") if meta else None
                             eff_vol = _effective_volume("semantic", doc_id, lr_prev)
-                            _reinforce(
-                                "semantic", doc_id, quality=0.5, last_reinforced_at=lr_prev
-                            )
-                            meta["last_reinforced_at"] = datetime.now().isoformat()
-                            try:
-                                collection.update(ids=[doc_id], metadatas=[meta])
-                            except Exception:
-                                pass
 
                             date = meta.get("date", "unknown") if meta else "unknown"
                             tags = meta.get("tags", "") if meta else ""
                             tag_str = f" [{tags}]" if tags else ""
                             shown["semantic"].add(doc_id)
-                            mem_lines.append(
-                                f"  [{score:.2f}] id={doc_id} ({date}){tag_str} (vol: {eff_vol:.1f}) {_preview(doc, 600)}"
+                            line = (
+                                f"  [{score:.2f}] id={doc_id} ({date}){tag_str} (vol: {eff_vol:.1f}) "
+                                f"{_preview(doc, RECALL_SEMANTIC_PREVIEW)}"
                             )
+                            mem_lines.append(line)
+                            pending_semantic.append((line, doc_id, lr_prev, meta, collection))
                         if mem_lines:
                             sections.append("Semantic memories:\n" + "\n".join(mem_lines))
     except Exception:
@@ -1320,7 +1418,7 @@ def recall(
         NOTES_DIR.mkdir(parents=True, exist_ok=True)
         doc_matches = []
         for md_file in sorted(NOTES_DIR.rglob("*.md")):
-            if len(doc_matches) >= n_results:
+            if len(doc_matches) >= min(n_results, RECALL_DOC_MAX_LINES):
                 break
             rel_path = md_file.relative_to(NOTES_DIR)
             name_match = (
@@ -1330,7 +1428,7 @@ def recall(
             content = md_file.read_text(encoding="utf-8")
             content_match = query_lower in content.lower()
             if name_match or content_match:
-                preview = content[:200].replace("\n", " ").strip()
+                preview = content[:RECALL_DOC_PREVIEW].replace("\n", " ").strip()
                 rel_display = str(rel_path.with_suffix(""))
                 shown["doc"].add(rel_display)
                 doc_matches.append(f"  {rel_display}: {preview}...")
@@ -1377,11 +1475,12 @@ def recall(
             ),
             reverse=True,
         )
-        shown["causal"].update(r["id"] for r in causal_cands[:n_results])
+        causal_shown = causal_cands[: min(n_results, RECALL_CAUSAL_MAX_LINES)]
+        shown["causal"].update(r["id"] for r in causal_shown)
         causal_lines = [
             f"  [L{r['layer']} {r['confidence']:.2f}] {r['id']}: "
-            f"{_preview(r['text'], 400)}"
-            for r in causal_cands[:n_results]
+            f"{_preview(r['text'], RECALL_CAUSAL_PREVIEW)}"
+            for r in causal_shown
         ]
         if causal_lines:
             sections.append("Causal memories:\n" + "\n".join(causal_lines))
@@ -1395,10 +1494,11 @@ def recall(
             if query_cf not in haystack.casefold():
                 continue
             belief_lines.append(
-                f"  {b['subject']} -[{b['predicate']}]-> {b['object']} "
+                f"  {b['subject']} -[{b['predicate']}]-> "
+                f"{_preview(str(b['object']), RECALL_BELIEF_PREVIEW)} "
                 f"(conf: {b['confidence']:.2f}, src: {b['source']})"
             )
-            if len(belief_lines) >= n_results:
+            if len(belief_lines) >= min(n_results, RECALL_BELIEF_MAX_LINES):
                 break
         if belief_lines:
             sections.append("Beliefs:\n" + "\n".join(belief_lines))
@@ -1423,15 +1523,19 @@ def recall(
     if has_vectors:
         try:
             query_vector = embed_query(query)
-            for title, kind in (
-                ("Facts", "fact"),
-                ("Semantic memories", "semantic"),
-                ("Documents", "doc"),
-                ("Causal memories", "causal"),
+            for title, kind, limit in (
+                ("Facts", "fact", min(n_results, RECALL_FACT_VECTOR_TOPUP)),
+                ("Semantic memories", "semantic", min(n_results, RECALL_SEMANTIC_VECTOR_TOPUP)),
+                ("Documents", "doc",
+                 min(n_results, RECALL_DOC_MAX_LINES) - len(shown["doc"])),
+                ("Causal memories", "causal",
+                 min(n_results, RECALL_CAUSAL_MAX_LINES) - len(shown["causal"])),
             ):
+                if limit <= 0:
+                    continue  # _vector_topup would still emit one line at 0
                 _vector_topup(
                     sections, title, kind, query_vector,
-                    shown[kind], n_results, min_score,
+                    shown[kind], limit, min_score,
                 )
         except Exception:
             pass
@@ -1439,9 +1543,54 @@ def recall(
     if not sections:
         return f"Nothing found across all memory layers for: {query}"
 
-    return _clip_output(
-        f'Recall results for "{query}":\n\n' + "\n\n".join(sections)
+    out = _cap_chars(
+        f'Recall results for "{query}":\n\n' + "\n\n".join(sections),
+        RECALL_MAX_CHARS,
+        f"\n[recall output truncated at {RECALL_MAX_CHARS} chars - "
+        "narrow the query or open items with get_fact/read_doc]",
     )
+
+    try:
+        # ONE transaction for the whole reinforcement pass: without it this
+        # loop issues ~3 writes per selected fact (volume + event + row).
+        with db.write_txn() as txn:
+            for line, c in pending_facts:
+                if c["superseded_by"] or line not in out:
+                    continue  # superseded: frozen; cut: never reached the caller
+                _reinforce(
+                    "fact",
+                    c["key"],
+                    quality=0.5,
+                    last_reinforced_at=c["last_reinf"],
+                    conn=txn,
+                )
+                # db.fact_all() handed out ONE dict per key and the
+                # candidate rows above still reference it. Re-fetch a
+                # FRESH dict before mutating so the candidate entry cannot
+                # be corrupted by this write.
+                fresh = db.fact_get(c["key"])
+                if fresh is None:
+                    continue
+                fresh["last_reinforced_at"] = datetime.now().isoformat()
+                db.fact_set(c["key"], fresh, conn=txn)
+    except Exception:
+        pass
+
+    try:
+        for line, doc_id, lr, meta, collection in pending_semantic:
+            if line not in out:
+                continue
+            _reinforce("semantic", doc_id, quality=0.5, last_reinforced_at=lr)
+            if collection is not None and meta is not None:
+                meta["last_reinforced_at"] = datetime.now().isoformat()
+                try:
+                    collection.update(ids=[doc_id], metadatas=[meta])
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return out
 
 
 def _gather_facts() -> list[dict]:
@@ -1467,6 +1616,7 @@ def _gather_facts() -> list[dict]:
                 "updated_dt": _parse_ts(updated_at),
                 "expired": bool(exp_dt and now > exp_dt),
                 "last_reinf": lr,
+                "superseded_by": parsed.get("superseded_by"),
             }
         )
         keys.append(k)
@@ -1515,6 +1665,18 @@ def _semantic_snapshot() -> tuple[int, str, set[str]]:
     return count, "chroma", tags
 
 
+CONTEXT_MAX_CHARS = 6500
+CONTEXT_PREVIEW_CHARS = 120
+CONTEXT_PROJECTS_TOP = 10
+CONTEXT_RECENT_ITEMS = 8
+CONTEXT_SALIENT_ITEMS = 5
+CONTEXT_SEMANTIC_TAGS = 8
+_CONTEXT_TRUNCATED = (
+    f"\n[memory_context output truncated at {CONTEXT_MAX_CHARS} chars - "
+    "use list_facts(prefix=...) or get_fact(\"key\")]"
+)
+
+
 def _memory_context_zoom(project: str, facts: list[dict]) -> str:
     proj = project.casefold()
     matched = [f for f in facts if f["group"] == proj]
@@ -1529,12 +1691,14 @@ def _memory_context_zoom(project: str, facts: list[dict]) -> str:
             + "\n".join(lines)
         )
     matched.sort(key=lambda f: f["updated_at"], reverse=True)
-    builder = _BudgetedLines(40000)
+    header = f"{project} zoom · {len(matched)} facts · non-reinforcing\n"
+    builder = _BudgetedLines(CONTEXT_MAX_CHARS - len(header))
     for f in matched:
         fresh = "expired" if f["expired"] else "fresh"
+        sup_str = f" [superseded by {f['superseded_by']}]" if f.get("superseded_by") else ""
         block = (
             f"  {_mmdd(f)} · vol {f['vol']:.1f} · {fresh}\n"
-            f"    {f['key']}: {_preview(f['val'], 250, f['key'])}"
+            f"    {f['key']}{sup_str}: {_preview(f['val'], CONTEXT_PREVIEW_CHARS, f['key'])}"
         )
         builder.add(block)
     footer = (
@@ -1543,8 +1707,7 @@ def _memory_context_zoom(project: str, facts: list[dict]) -> str:
         if builder.omitted
         else None
     )
-    header = f"{project} zoom · {len(matched)} facts · non-reinforcing\n"
-    return _clip_output(header + builder.render(footer))
+    return _cap_chars(header + builder.render(footer), CONTEXT_MAX_CHARS, _CONTEXT_TRUNCATED)
 
 
 @mcp.tool()
@@ -1612,37 +1775,40 @@ def memory_context(project: str = "") -> str:
     )
 
     proj_lines = []
-    for name, g in ordered_groups[:15]:
+    for name, g in ordered_groups[:CONTEXT_PROJECTS_TOP]:
         line = f"  {name}  {g['count']} facts · latest {g['latest'][:10]}"
         if g["expired"]:
             line += f" · {g['expired']} expired"
         proj_lines.append(line)
-    rest = ordered_groups[15:]
+    rest = ordered_groups[CONTEXT_PROJECTS_TOP:]
     if rest:
         rest_count = sum(g["count"] for _n, g in rest)
         proj_lines.append(f"  other  {rest_count} facts across {len(rest)} groups")
     sections.append("Projects:\n" + "\n".join(proj_lines))
 
     by_updated = sorted(facts, key=lambda f: f["updated_at"], reverse=True)
-    recent = _diversify(by_updated, 2, 15)
+    recent = _diversify(by_updated, 2, CONTEXT_RECENT_ITEMS)
     recent_keys = {f["key"] for f in recent}
     if recent:
-        rlines = [
-            f"  [{f['group']} · {_mmdd(f)}] {f['key']}: {_preview(f['val'], 140, f['key'])}"
-            for f in recent
-        ]
+        rlines = []
+        for f in recent:
+            sup_str = f" [superseded by {f['superseded_by']}]" if f.get("superseded_by") else ""
+            rlines.append(
+                f"  [{f['group']} · {_mmdd(f)}] {f['key']}{sup_str}: "
+                f"{_preview(f['val'], CONTEXT_PREVIEW_CHARS, f['key'])}"
+            )
         sections.append("Recent:\n" + "\n".join(rlines))
 
     by_vol = sorted(
-        (f for f in facts if f["key"] not in recent_keys),
+        (f for f in facts if f["key"] not in recent_keys and not f.get("superseded_by")),
         key=lambda f: f["vol"],
         reverse=True,
     )
-    salient = _diversify(by_vol, 2, 15)
-    if len(salient) < 15:
+    salient = _diversify(by_vol, 2, CONTEXT_SALIENT_ITEMS)
+    if len(salient) < CONTEXT_SALIENT_ITEMS:
         chosen = {f["key"] for f in salient}
         for f in by_vol:
-            if len(salient) >= 15:
+            if len(salient) >= CONTEXT_SALIENT_ITEMS:
                 break
             if f["key"] in chosen:
                 continue
@@ -1650,7 +1816,8 @@ def memory_context(project: str = "") -> str:
             chosen.add(f["key"])
     if salient:
         slines = [
-            f"  [vol {f['vol']:.1f} · {f['group']}] {f['key']}: {_preview(f['val'], 140, f['key'])}"
+            f"  [vol {f['vol']:.1f} · {f['group']}] {f['key']}: "
+            f"{_preview(f['val'], CONTEXT_PREVIEW_CHARS, f['key'])}"
             for f in salient
         ]
         sections.append("Salient:\n" + "\n".join(slines))
@@ -1667,25 +1834,14 @@ def memory_context(project: str = "") -> str:
         f"oldest update {oldest[:10] or 'n/a'}"
     )
 
-    tag_str = ", ".join(sorted(sem_tags)) if sem_tags else "none"
+    tag_str = ", ".join(sorted(sem_tags)[:CONTEXT_SEMANTIC_TAGS]) if sem_tags else "none"
     sections.append(f"Semantic ({sem_count} · {sem_mode}):\n  recent tags: {tag_str}")
 
-    if folders:
-        dlines = []
-        for name, docs in folders[:20]:
-            teaser = docs[:2]
-            names = ", ".join(teaser)
-            remaining = len(docs) - len(teaser)
-            if remaining > 0:
-                names += f", +{remaining} more"
-            dlines.append(f"  {name}/ ({len(docs)}): {names}")
-        if len(folders) > 20:
-            dlines.append(f"  +{len(folders) - 20} more folders")
-        sections.append(f"Documents ({total_docs}):\n" + "\n".join(dlines))
-    else:
-        sections.append("Documents: (none)")
+    sections.append(f"Docs: {total_docs} in {len(folders)} folders (list_docs() to browse)")
 
-    return _clip_output("Memory context:\n\n" + "\n\n".join(sections), 12000)
+    return _cap_chars(
+        "Memory context:\n\n" + "\n\n".join(sections), CONTEXT_MAX_CHARS, _CONTEXT_TRUNCATED
+    )
 
 
 # ===================================================================
@@ -1746,7 +1902,7 @@ def reinforce(key: str, layer: str = "fact") -> str:
     new_vol = _reinforce(layer, key, quality=1.0, last_reinforced_at=prev_lr)
 
     now_iso = datetime.now().isoformat()
-    if layer == "fact" and fact_parsed is not None:
+    if layer == "fact" and fact_parsed is not None and not fact_parsed.get("superseded_by"):
         fact_parsed["last_reinforced_at"] = now_iso
         db.fact_set(key, fact_parsed)
     elif layer == "semantic":
@@ -2274,23 +2430,26 @@ def _render_vector_line(kind: str, key: str, score: float) -> str | None:
     tag = f"  [vec {score:.2f}]"
     if kind == "fact":
         row = db.fact_get(key)
-        return f"{tag} {key}: {_preview(row.get('value', ''), 400, key)}" if row else None
+        if not row:
+            return None
+        sup_str = f" [superseded by {row['superseded_by']}]" if row.get("superseded_by") else ""
+        return f"{tag} {key}{sup_str}: {_preview(row.get('value', ''), RECALL_FACT_PREVIEW, key)}"
     if kind == "causal":
         row = db.causal_get(key)
         if not row:
             return None
         return (
             f"{tag} [L{row['layer']} {row['confidence']:.2f}] {key}: "
-            f"{_preview(row['text'], 400)}"
+            f"{_preview(row['text'], RECALL_CAUSAL_PREVIEW)}"
         )
     if kind == "doc":
         path = NOTES_DIR / f"{key}.md"
         if not path.exists():
             return None
-        return f"{tag} {key}: {_preview(path.read_text(encoding='utf-8'), 200)}"
+        return f"{tag} {key}: {_preview(path.read_text(encoding='utf-8'), RECALL_DOC_PREVIEW)}"
     if kind == "semantic":
         text = _semantic_document(key)
-        return f"{tag} id={key} {_preview(text, 600)}" if text else None
+        return f"{tag} id={key} {_preview(text, RECALL_SEMANTIC_PREVIEW)}" if text else None
     return None
 
 
@@ -2343,37 +2502,66 @@ _fact_embed_cache: dict | None = None
 _fact_embed_lock = threading.Lock()
 
 
-def _build_fact_embeddings() -> dict | None:
+def _fact_text(key: str, value: str) -> str:
+    return f"{key}: {value[:300]}"
+
+
+def _build_fact_embeddings(previous: dict | None = None) -> dict | None:
+    """Fact vectors keyed by the facts' ``updated_at`` stamps.
+
+    Every opencode window runs its own server, and each used to keep its
+    cache until one of ITS OWN tools wrote a fact, so facts saved from another
+    window never reached this window's prompt hook. Rebuilding is incremental:
+    only facts whose stamp changed since ``previous`` are re-encoded.
+    """
     try:
         all_facts = db.fact_all()
         if not all_facts:
             return None
+        stamps = {k: p.get("updated_at", "") for k, p in all_facts.items()}
+        old_rows: dict[str, np.ndarray] = {}
+        if previous is not None:
+            for i, key in enumerate(previous["keys"]):
+                if previous["stamps"].get(key) == stamps.get(key):
+                    old_rows[key] = previous["matrix"][i]
 
-        keys, values, texts = [], [], []
-        for key, parsed in all_facts.items():
-            value = parsed.get("value", "")
-            keys.append(key)
-            values.append(value)
-            texts.append(f"{key}: {value[:300]}")
-
-        if not texts:
-            return None
-
-        encoder = get_encoder()
-        matrix = encoder.encode(
-            texts, show_progress_bar=False, normalize_embeddings=True
-        )
-        return {"keys": keys, "values": values, "matrix": matrix}
+        keys = list(all_facts)
+        values = [str(all_facts[k].get("value", "")) for k in keys]
+        todo = [i for i, k in enumerate(keys) if k not in old_rows]
+        fresh: dict[str, np.ndarray] = {}
+        if todo:
+            encoded = get_encoder().encode(
+                [_fact_text(keys[i], values[i]) for i in todo],
+                show_progress_bar=False,
+                normalize_embeddings=True,
+            )
+            fresh = {keys[i]: encoded[j] for j, i in enumerate(todo)}
+        matrix = np.vstack([old_rows.get(k, fresh.get(k)) for k in keys])
+        return {"keys": keys, "values": values, "matrix": matrix, "stamps": stamps}
     except Exception:
-        return None
+        return previous
+
+
+def _fact_fingerprint() -> tuple[int, str]:
+    with db.read_conn() as c:
+        row = c.execute("SELECT COUNT(*), COALESCE(MAX(updated_at), '') FROM facts").fetchone()
+    return int(row[0]), str(row[1])
 
 
 def _get_fact_embeddings() -> dict | None:
     global _fact_embed_cache
     with _fact_embed_lock:
-        if _fact_embed_cache is None:
-            _fact_embed_cache = _build_fact_embeddings()
-        return _fact_embed_cache
+        try:
+            fingerprint = _fact_fingerprint()
+        except Exception:
+            fingerprint = None
+        cache = _fact_embed_cache
+        if cache is None or fingerprint is None or cache.get("fingerprint") != fingerprint:
+            cache = _build_fact_embeddings(cache)
+            if cache is not None:
+                cache["fingerprint"] = fingerprint
+            _fact_embed_cache = cache
+        return cache
 
 
 def _invalidate_fact_embeddings():
@@ -2408,8 +2596,14 @@ def _search_facts_semantic(query_embedding: np.ndarray, n: int = 10) -> list[dic
         vol = stored if stored is not None else 50.0
         updated_at = None
         expired = False
+        value = cache["values"][idx][:200]
         parsed = db.fact_get(fact_key)
         if parsed:
+            # Shown, never hidden: most corrections rewrite only part of the
+            # older fact. The marker leads the value so that the hook's short
+            # preview still carries it.
+            if parsed.get("superseded_by"):
+                value = f"[superseded by {parsed['superseded_by']}] {value}"
             updated_at = parsed.get("updated_at")
             expires_at = parsed.get("expires_at")
             if expires_at:
@@ -2421,7 +2615,7 @@ def _search_facts_semantic(query_embedding: np.ndarray, n: int = 10) -> list[dic
         results.append(
             {
                 "key": fact_key,
-                "value": cache["values"][idx][:200],
+                "value": value,
                 "score": round(sim, 3),
                 "volume": round(float(vol), 1),
                 "updated_at": updated_at,

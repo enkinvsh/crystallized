@@ -20,6 +20,10 @@ Crystallized becomes a self-contained, self-evolving memory engine. The Redis de
 
 ### Added
 
+- Added first-class fact supersession (`db.fact_supersede`, `volume.demote_superseded`, migration `MIGRATIONS[6]` adding `superseded_by`). An old fact is linked to the fact that corrects it, stops gaining volume on recall, is capped at 0.8 of its correction's volume (re-applied down the chain when the correction is itself superseded) so the correction ranks first, and leaves the salient/loudest views. It is never hidden: `get_fact`, `list_facts`, `recall`, `memory_context` and the prompt hook show it with a `superseded by` pointer, because about half of real corrections rewrite only part of the older fact.
+- Added new MCP tool `supersede_fact(old_key, new_key)` to manually link or clear fact supersessions.
+- Added `supersedes` parameter to `save_fact` for explicit supersession links alongside automatic textual cue recognition.
+- Added `--link-supersessions` CLI mode to `dream.py` to scan and retroactively link textual corrections without full nightly consolidation.
 - Added a SQLite storage layer (`memory/db.py`) running in WAL mode with a `PRAGMA user_version` migration runner, so future schema changes apply in order instead of being silently skipped.
 - Added `causal_memories`, a layered episodic trace that promotes raw signal into episodes, patterns, and principles.
 - Added `belief_state`, a bi-temporal belief table with `valid_from` / `valid_to` / `recorded_at` and a partial unique index that allows exactly one active belief per subject and predicate. Superseded beliefs are marked, never deleted.
