@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Память</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --line: #e4e1da; --text: #1d1c1a; --muted: #6f6b63;
+    --accent: #2f5d50; --accent-soft: #e3ece8; --warn: #9a3b2e; --warn-soft: #f6e5e1; --mark: #8a6d1f;
+    --radius: 8px; --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #151514; --panel: #1d1d1b; --line: #2e2d2a; --text: #ecebe7; --muted: #9a968d;
+      --accent: #8fc2b1; --accent-soft: #23312c; --warn: #e59a8c; --warn-soft: #3a2320; --mark: #d8b764; }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Inter", system-ui, sans-serif;
+    background: var(--bg); color: var(--text); display: grid;
+    grid-template-columns: 230px minmax(320px, 440px) 1fr; }
+  aside, main, section { min-height: 0; overflow: auto; }
+  aside { border-right: 1px solid var(--line); padding: 16px 10px; }
+  main { border-right: 1px solid var(--line); display: flex; flex-direction: column; }
+  h1 { font-size: 15px; margin: 0 8px 12px; letter-spacing: .01em; }
+  .tabs { display: flex; gap: 4px; margin: 0 6px 12px; }
+  .tabs button, .grp { all: unset; cursor: pointer; }
+  .tabs button { padding: 4px 10px; border-radius: 999px; color: var(--muted); }
+  .tabs button[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  .grp { display: flex; justify-content: space-between; width: 100%; padding: 5px 8px; border-radius: 6px; color: var(--text); }
+  .grp span:last-child { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .grp:hover { background: var(--accent-soft); }
+  .grp[aria-current="true"] { background: var(--accent); color: var(--panel); }
+  .grp[aria-current="true"] span:last-child { color: inherit; opacity: .8; }
+  .grp:focus-visible, button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .search { position: sticky; top: 0; background: var(--bg); padding: 14px 14px 10px; border-bottom: 1px solid var(--line); }
+  input[type=search], input[type=text], textarea { width: 100%; font: inherit; color: var(--text);
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 10px; }
+  .count { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  ul { list-style: none; margin: 0; padding: 6px; }
+  li button { all: unset; display: block; width: 100%; box-sizing: border-box; cursor: pointer; padding: 9px 10px; border-radius: var(--radius); }
+  li button:hover { background: var(--panel); }
+  li button[aria-current="true"] { background: var(--panel); box-shadow: inset 3px 0 0 var(--accent); }
+  .k { font-family: var(--mono); font-size: 12px; word-break: break-all; }
+  .meta { color: var(--muted); font-size: 12px; margin: 2px 0; }
+  .pv { color: var(--muted); font-size: 13px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .sup { color: var(--mark); font-size: 12px; }
+  li.retracted .k { text-decoration: line-through; text-decoration-color: var(--mark); }
+  section { padding: 22px 28px; }
+  .empty { color: var(--muted); margin-top: 20vh; text-align: center; }
+  .head { display: flex; gap: 12px; align-items: baseline; justify-content: space-between; flex-wrap: wrap; }
+  .head .k { font-size: 13px; }
+  .note { background: var(--accent-soft); border-radius: var(--radius); padding: 8px 12px; margin: 12px 0; }
+  .note.mark { background: color-mix(in srgb, var(--mark) 16%, transparent); }
+  .note a { color: var(--accent); cursor: pointer; }
+  textarea { min-height: 52vh; font: 13px/1.5 var(--mono); resize: vertical; margin-top: 12px; }
+  .row { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; align-items: center; }
+  .btn { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text);
+    padding: 7px 14px; border-radius: var(--radius); cursor: pointer; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--panel); font-weight: 600; }
+  .btn.danger { color: var(--warn); }
+  .btn.danger:hover { background: var(--warn-soft); }
+  .btn:disabled { opacity: .45; cursor: default; }
+  .row input[type=text] { flex: 1; min-width: 220px; font-family: var(--mono); font-size: 12px; }
+  #toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg);
+    padding: 9px 14px; border-radius: 999px; display: none; gap: 12px; align-items: center; box-shadow: 0 6px 24px rgba(0,0,0,.18); }
+  #toast button { all: unset; cursor: pointer; font-weight: 700; color: var(--accent-soft); }
+  @media (max-width: 900px) { body { grid-template-columns: 1fr; } aside, main { border: 0; max-height: 40vh; } }
+</style>
+</head>
+<body>
+<aside aria-label="Разделы">
+  <h1>Память агента</h1>
+  <div class="tabs" role="group" aria-label="Слой">
+    <button id="tab-facts" aria-pressed="true">Факты</button>
+    <button id="tab-docs" aria-pressed="false">Документы</button>
+  </div>
+  <div id="groups"></div>
+</aside>
+<main>
+  <div class="search">
+    <input id="q" type="search" placeholder="Поиск по ключу и тексту" aria-label="Поиск" autocomplete="off">
+    <div class="count" id="count"></div>
+  </div>
+  <ul id="list"></ul>
+</main>
+<section id="detail" aria-live="polite"><p class="empty">Выберите запись слева</p></section>
+<div id="toast" role="status"><span id="toast-text"></span><button id="undo" hidden>Вернуть</button></div>
+<script>
+const token = new URLSearchParams(location.search).get("t") || "";
+const state = { tab: "facts", group: "", folder: "", q: "", selected: null };
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
+async function api(path, body) {
+  const res = await fetch(path, body === undefined
+    ? { headers: { "X-Token": token } }
+    : { method: "POST", headers: { "X-Token": token, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+function toast(text, undoable) {
+  $("toast-text").textContent = text;
+  $("undo").hidden = !undoable;
+  $("toast").style.display = "flex";
+  clearTimeout(toast.t);
+  toast.t = setTimeout(() => ($("toast").style.display = "none"), undoable ? 9000 : 3000);
+}
+
+let sideSeq = 0;
+async function loadSidebar() {
+  const seq = ++sideSeq;
+  if (state.tab === "facts") {
+    const { groups } = await api("/api/groups");
+    if (seq !== sideSeq) return;
+    const total = groups.reduce((n, g) => n + g.facts, 0);
+    $("groups").innerHTML = [{ name: "", facts: total }, ...groups].map((g) =>
+      `<button class="grp" data-g="${esc(g.name)}" aria-current="${g.name === state.group}"><span>${esc(g.name || "все")}</span><span>${g.facts}</span></button>`).join("");
+  } else {
+    const { folders } = await api("/api/docs");
+    if (seq !== sideSeq) return;
+    $("groups").innerHTML = folders.map((f) =>
+      `<button class="grp" data-g="${esc(f.name)}" aria-current="${f.name === state.folder}"><span>${esc(f.name)}</span><span>${f.docs}</span></button>`).join("");
+  }
+}
+
+let listSeq = 0;
+async function loadList() {
+  const seq = ++listSeq;  // a slower, older response must not overwrite a newer one
+  if (state.tab === "facts") {
+    const p = new URLSearchParams({ group: state.group, q: state.q });
+    const { total, facts } = await api("/api/facts?" + p);
+    if (seq !== listSeq) return;
+    $("count").textContent = total > facts.length ? `${total} фактов, показаны ${facts.length} новых` : `${total} фактов`;
+    $("list").innerHTML = facts.map((f) => `<li class="${f.superseded_by ? "retracted" : ""}"><button data-key="${esc(f.key)}" aria-current="${f.key === state.selected}">
+      <div class="k">${esc(f.key)}</div>
+      <div class="meta">${esc(f.updated_at.slice(0, 10))} · громкость ${f.vol}${f.superseded_by ? ` · <span class="sup">отменён</span>` : ""}</div>
+      <div class="pv">${esc(f.preview)}</div></button></li>`).join("");
+  } else {
+    if (!state.folder) { $("list").innerHTML = ""; $("count").textContent = "Выберите папку"; return; }
+    const { docs } = await api("/api/docs?" + new URLSearchParams({ folder: state.folder }));
+    if (seq !== listSeq) return;
+    const shown = docs.filter((d) => !state.q || d.name.toLowerCase().includes(state.q.toLowerCase()));
+    $("count").textContent = `${shown.length} документов`;
+    $("list").innerHTML = shown.map((d) => `<li><button data-doc="${esc(d.name)}" aria-current="${d.name === state.selected}">
+      <div class="k">${esc(d.name)}</div><div class="meta">${esc(d.mtime.replace("T", " "))} · ${Math.ceil(d.size / 1024)} КБ</div></button></li>`).join("");
+  }
+}
+
+async function openFact(key) {
+  state.selected = key;
+  const f = await api("/api/fact?" + new URLSearchParams({ key }));
+  const sup = f.superseded_by
+    ? `<div class="note mark">Отменён или переписан фактом <a data-open="${esc(f.superseded_by)}" class="k">${esc(f.superseded_by)}</a>. Агент видит его с этой пометкой и читает сначала новый.</div>` : "";
+  const pre = f.supersedes.length
+    ? `<div class="note">Этот факт отменяет: ${f.supersedes.map((k) => `<a data-open="${esc(k)}" class="k">${esc(k)}</a>`).join(", ")}</div>` : "";
+  $("detail").innerHTML = `
+    <div class="head"><span class="k">${esc(f.key)}</span><span class="meta">изменён ${esc((f.updated_at || "").replace("T", " ").slice(0, 16))} · громкость ${f.vol} · TTL ${esc(f.ttl_days)} д.</span></div>
+    ${sup}${pre}
+    <textarea id="val" aria-label="Текст факта">${esc(f.value)}</textarea>
+    <div class="row">
+      <button class="btn primary" id="save" disabled>Сохранить</button>
+      <button class="btn danger" id="del">Удалить</button>
+    </div>
+    <div class="row">
+      <input type="text" id="sup-new" placeholder="ключ факта, который отменяет этот" value="${esc(f.superseded_by || "")}" aria-label="Отменён фактом">
+      <button class="btn" id="sup">${f.superseded_by ? "Изменить" : "Пометить отменённым"}</button>
+      ${f.superseded_by ? `<button class="btn" id="unsup">Снять пометку</button>` : ""}
+    </div>`;
+  const val = $("val");
+  val.addEventListener("input", () => ($("save").disabled = val.value === f.value));
+  $("save").onclick = async () => { await api("/api/fact/save", { key, value: val.value }); toast("Сохранено"); openFact(key); loadList(); };
+  $("del").onclick = async () => { await api("/api/fact/delete", { key }); toast(`Удалён ${key}`, true); clearDetail(); loadList(); loadSidebar(); };
+  $("sup").onclick = async () => {
+    try { await api("/api/fact/supersede", { old: key, new: $("sup-new").value.trim() }); toast("Помечен"); openFact(key); loadList(); }
+    catch (e) { toast(e.message); }
+  };
+  if ($("unsup")) $("unsup").onclick = async () => { await api("/api/fact/supersede", { old: key, new: "" }); toast("Пометка снята"); openFact(key); loadList(); };
+  markSelected();
+}
+
+async function openDoc(name) {
+  state.selected = name;
+  const d = await api("/api/doc?" + new URLSearchParams({ folder: state.folder, name }));
+  $("detail").innerHTML = `
+    <div class="head"><span class="k">${esc(d.folder)}/${esc(d.name)}.md</span></div>
+    <textarea id="val" aria-label="Текст документа">${esc(d.content)}</textarea>
+    <div class="row"><button class="btn primary" id="save" disabled>Сохранить</button><button class="btn danger" id="del">Удалить</button></div>`;
+  const val = $("val");
+  val.addEventListener("input", () => ($("save").disabled = val.value === d.content));
+  $("save").onclick = async () => { await api("/api/doc/save", { folder: d.folder, name, content: val.value }); toast("Сохранено"); openDoc(name); };
+  $("del").onclick = async () => { await api("/api/doc/delete", { folder: d.folder, name }); toast(`Удалён ${name}`, true); clearDetail(); loadList(); loadSidebar(); };
+  markSelected();
+}
+
+function clearDetail() { state.selected = null; $("detail").innerHTML = `<p class="empty">Выберите запись слева</p>`; }
+function markSelected() {
+  document.querySelectorAll("#list button").forEach((b) => b.setAttribute("aria-current", String((b.dataset.key || b.dataset.doc) === state.selected)));
+}
+
+$("groups").onclick = (e) => {
+  const b = e.target.closest(".grp"); if (!b) return;
+  if (state.tab === "facts") state.group = b.dataset.g; else state.folder = b.dataset.g;
+  clearDetail(); loadSidebar(); loadList();
+};
+$("list").onclick = (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  b.dataset.key ? openFact(b.dataset.key) : openDoc(b.dataset.doc);
+};
+$("detail").onclick = (e) => { const a = e.target.closest("[data-open]"); if (a) openFact(a.dataset.open); };
+let debounce;
+$("q").oninput = (e) => { clearTimeout(debounce); debounce = setTimeout(() => { state.q = e.target.value.trim(); loadList(); }, 200); };
+for (const tab of ["facts", "docs"]) {
+  $("tab-" + tab).onclick = () => {
+    state.tab = tab; state.selected = null; state.q = ""; $("q").value = "";
+    $("tab-facts").setAttribute("aria-pressed", String(tab === "facts"));
+    $("tab-docs").setAttribute("aria-pressed", String(tab === "docs"));
+    clearDetail(); loadSidebar(); loadList();
+  };
+}
+$("undo").onclick = async () => {
+  const r = await api("/api/undo", {});
+  $("toast").style.display = "none";
+  if (r.restored) { toast(`Восстановлен ${r.restored}`); loadSidebar(); loadList(); }
+};
+loadSidebar().then(loadList).catch((e) => ($("detail").innerHTML = `<p class="empty">${esc(e.message)}</p>`));
+</script>
+</body>
+</html>
