@@ -20,7 +20,7 @@ import random
 import re
 import sqlite3
 import threading
-from collections.abc import Collection, Iterator
+from collections.abc import Collection, Iterable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -246,6 +246,16 @@ ALTER TABLE facts ADD COLUMN superseded_by TEXT;
 CREATE INDEX IF NOT EXISTS idx_facts_superseded_by ON facts(superseded_by);
 """
 
+_V7_SCHEMA_SQL = """
+-- sha1 of the exact text a key's chunks were embedded from. The index is kept
+-- current by comparing it with the record as it reads NOW: no row means the
+-- record was never indexed, a different hash means its vectors describe an
+-- older text. NULL marks a row written before this column existed: its text
+-- is unknown, so it keeps answering searches until it is re-embedded, but it
+-- is never taken as proof that the record is current.
+ALTER TABLE embeddings ADD COLUMN src_hash TEXT;
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: _V1_SCHEMA_SQL,
     2: _V2_SCHEMA_SQL,
@@ -253,6 +263,7 @@ MIGRATIONS: dict[int, str] = {
     4: _V4_REPAIR_SQL,
     5: _V5_SCHEMA_SQL,
     6: _V6_SCHEMA_SQL,
+    7: _V7_SCHEMA_SQL,
 }
 
 # ---------------------------------------------------------------------------
@@ -1055,6 +1066,7 @@ def embedding_upsert(
     model: str,
     dim: int,
     conn: sqlite3.Connection | None = None,
+    src_hash: str | None = None,
 ) -> int:
     """Replace EVERY chunk of one key, atomically.
 
@@ -1063,10 +1075,13 @@ def embedding_upsert(
     row-by-row would leave the surplus tail behind as orphaned vectors that
     still answer searches. Wiping the key first is what makes the backfill
     re-runnable.
+
+    ``src_hash`` identifies the text the chunks came from; every chunk of the
+    key carries the same one (see migration 7).
     """
     now_iso = datetime.now(timezone.utc).isoformat()
     rows = [
-        (kind, key, ix, model, dim, vec, now_iso)
+        (kind, key, ix, model, dim, vec, now_iso, src_hash)
         for ix, vec in enumerate(chunks)
     ]
 
@@ -1075,8 +1090,8 @@ def embedding_upsert(
         if rows:
             c.executemany(
                 "INSERT INTO embeddings "
-                "(kind, key, chunk_ix, model, dim, vec, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "(kind, key, chunk_ix, model, dim, vec, updated_at, src_hash) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
 
@@ -1099,8 +1114,45 @@ def embedding_delete(
         return c.execute(sql, (kind, key)).rowcount
 
 
+def embedding_hashes(kind: str, model: str) -> dict[str, str]:
+    """``{key: src_hash}`` for every key of one kind indexed under ``model``.
+
+    Read from chunk 0 alone, since every chunk of a key is written by one
+    upsert with one hash. A row from before migration 7 maps to ``""``: the
+    key is indexed, but from a text nobody recorded.
+    """
+    with read_conn() as c:
+        raw = c.execute(
+            "SELECT key, COALESCE(src_hash, '') FROM embeddings "
+            "WHERE kind = ? AND model = ? AND chunk_ix = 0",
+            (kind, model),
+        ).fetchall()
+    return {str(r[0]): str(r[1]) for r in raw}
+
+
+def embedding_stamp(kinds: Iterable[str], model: str) -> tuple[int, str]:
+    """``(row count, newest updated_at)`` over some kinds: a change detector.
+
+    Every upsert stamps its rows with the current time and every delete lowers
+    the count, so a write from ANY process moves this pair. It costs one
+    aggregate query (~20 ms over 60k rows), against ~0.6 s for reloading the
+    table it guards.
+    """
+    kinds = tuple(kinds)
+    marks = ", ".join("?" for _ in kinds)
+    with read_conn() as c:
+        row = c.execute(
+            "SELECT COUNT(*), COALESCE(MAX(updated_at), '') FROM embeddings "
+            f"WHERE kind IN ({marks}) AND model = ?",
+            (*kinds, model),
+        ).fetchone()
+    return int(row[0]), str(row[1])
+
+
 def embedding_load(
-    kind: str | None = None, model: str | None = None
+    kind: str | None = None,
+    model: str | None = None,
+    kinds: Iterable[str] | None = None,
 ) -> tuple[list[dict], np.ndarray]:
     """Chunk metadata plus the stacked, normalized matrix.
 
@@ -1120,6 +1172,10 @@ def embedding_load(
     if kind is not None:
         clauses.append("kind = ?")
         params.append(kind)
+    if kinds is not None:
+        kinds = tuple(kinds)
+        clauses.append(f"kind IN ({', '.join('?' for _ in kinds)})")
+        params.extend(kinds)
     if model is not None:
         clauses.append("model = ?")
         params.append(model)

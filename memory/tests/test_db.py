@@ -561,6 +561,54 @@ class TestEmbeddingStorage:
         assert rows == []
         assert matrix.shape == (0, 0)
 
+    def test_load_can_be_filtered_by_several_kinds(self):
+        for kind in ("fact", "causal", "fact_head"):
+            db.embedding_upsert(kind, kind, [_unit(1, 0, 0, 0)], model=MODEL, dim=4)
+
+        rows, _ = db.embedding_load(kinds=("fact", "causal"), model=MODEL)
+
+        assert sorted(r["kind"] for r in rows) == ["causal", "fact"]
+
+    def test_the_source_hash_is_recorded_per_key_and_model(self):
+        db.embedding_upsert("fact", "k1", [_unit(1, 0, 0, 0)] * 2, model=MODEL, dim=4, src_hash="h1")
+        db.embedding_upsert("fact", "k2", [_unit(0, 1, 0, 0)], model="older-v1", dim=4, src_hash="h2")
+        db.embedding_upsert("doc", "k3", [_unit(0, 0, 1, 0)], model=MODEL, dim=4, src_hash="h3")
+
+        assert db.embedding_hashes("fact", MODEL) == {"k1": "h1"}
+
+    def test_the_stamp_moves_on_every_write(self):
+        kinds = ("fact", "doc")
+        empty = db.embedding_stamp(kinds, MODEL)
+        db.embedding_upsert("fact", "k1", [_unit(1, 0, 0, 0)], model=MODEL, dim=4)
+        after_insert = db.embedding_stamp(kinds, MODEL)
+        db.embedding_upsert("fact_head", "k1", [_unit(1, 0, 0, 0)], model=MODEL, dim=4)
+        db.embedding_delete("fact", "k1")
+
+        assert empty == (0, "")
+        assert after_insert[0] == 1 and after_insert[1] > ""
+        assert db.embedding_stamp(kinds, MODEL)[0] == 0  # the other kind is not counted
+
+    def test_migration_7_keeps_legacy_rows_serving_with_an_unknown_hash(self, tmp_path):
+        db.close_db()
+        v6_file = tmp_path / "v6.sqlite"
+        conn = sqlite3.connect(str(v6_file))
+        for v in range(1, 7):
+            conn.executescript(db.MIGRATIONS[v])
+            conn.execute(f"PRAGMA user_version = {v}")
+        conn.execute(
+            "INSERT INTO embeddings (kind, key, chunk_ix, model, dim, vec, updated_at) "
+            "VALUES ('fact', 'legacy', 0, ?, 4, ?, '2026-08-23T15:10:05+00:00')",
+            (MODEL, _unit(1, 0, 0, 0)),
+        )
+        conn.commit()
+        conn.close()
+
+        db.set_db_path(v6_file)
+
+        assert _user_version() == 7
+        assert db.embedding_hashes("fact", MODEL) == {"legacy": ""}
+        assert [r["key"] for r in db.embedding_load(model=MODEL)[0]] == ["legacy"]
+
 
 class TestBeliefNamespaceScoping:
     """`belief_list_active(subject=...)` has always documented a PREFIX filter.
