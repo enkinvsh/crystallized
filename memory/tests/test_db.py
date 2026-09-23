@@ -485,7 +485,7 @@ def _unit(*values: float) -> bytes:
 
 class TestEmbeddingStorage:
     def test_migration_5_creates_the_table(self):
-        assert _user_version() == 5
+        assert _user_version() >= 5
 
     def test_chunks_round_trip_byte_identical(self):
         chunks = [_unit(1, 0, 0, 0), _unit(0, 1, 0, 0)]
@@ -612,3 +612,164 @@ class TestBeliefNamespaceScoping:
         )
         got = {r["subject"] for r in store.belief_all_active(subject="a_b")}
         assert got == {"a_b"}
+
+
+class TestSupersession:
+    def test_migration_v6_fresh_and_upgrade(self, tmp_path):
+        # 1. Fresh db already runs through v6
+        assert db.fact_count() == 0
+        db.fact_set("k1", {"value": "val1"})
+        f = db.fact_get("k1")
+        assert "superseded_by" not in f
+
+        # 2. Test upgrade from user_version 5
+        db.close_db()
+        v5_file = tmp_path / "v5.sqlite"
+        conn = sqlite3.connect(str(v5_file))
+        for v in range(1, 6):
+            conn.executescript(db.MIGRATIONS[v])
+            conn.execute(f"PRAGMA user_version = {v}")
+        conn.execute("INSERT INTO facts(key, value, updated_at, last_reinforced_at, ttl_days, expires_at) VALUES('old_fact', 'old_val', '2026-01-01', '2026-01-01', 90, '2026-04-01')")
+        conn.commit()
+        conn.close()
+
+        db.set_db_path(v5_file)
+        f_upgraded = db.fact_get("old_fact")
+        assert f_upgraded is not None
+        assert f_upgraded["value"] == "old_val"
+        assert "superseded_by" not in f_upgraded
+
+    def test_fact_upsert_preserves_superseded_by(self):
+        db.fact_set("old_k", {"value": "old_val"})
+        db.fact_set("new_k", {"value": "new_val"})
+        db.fact_supersede("old_k", "new_k")
+
+        f = db.fact_get("old_k")
+        assert f["superseded_by"] == "new_k"
+
+        # Re-save old fact
+        db.fact_set("old_k", {"value": "updated_old_val"})
+        f2 = db.fact_get("old_k")
+        assert f2["value"] == "updated_old_val"
+        assert f2["superseded_by"] == "new_k"
+
+    def test_fact_supersede_and_clear(self):
+        db.fact_set("k1", {"value": "v1"})
+        db.fact_set("k2", {"value": "v2"})
+
+        # Missing old_key
+        with pytest.raises(ValueError, match="not found"):
+            db.fact_supersede("missing_old", "k2")
+
+        # Missing new_key
+        with pytest.raises(ValueError, match="not found"):
+            db.fact_supersede("k1", "missing_new")
+
+        # Self-supersession
+        with pytest.raises(ValueError, match="cannot supersede itself"):
+            db.fact_supersede("k1", "k1")
+
+        # Normal supersede
+        db.fact_supersede("k1", "k2")
+        assert db.fact_get("k1")["superseded_by"] == "k2"
+        assert db.fact_all()["k1"]["superseded_by"] == "k2"
+
+        # Clear link with None or empty
+        db.fact_supersede("k1", None)
+        assert "superseded_by" not in db.fact_get("k1")
+
+        db.fact_supersede("k1", "k2")
+        db.fact_supersede("k1", "")
+        assert "superseded_by" not in db.fact_get("k1")
+
+    def test_fact_supersede_cycle_detection(self):
+        db.fact_set("k1", {"value": "v1"})
+        db.fact_set("k2", {"value": "v2"})
+        db.fact_set("k3", {"value": "v3"})
+
+        db.fact_supersede("k1", "k2")
+        db.fact_supersede("k2", "k3")
+
+        # k3 -> k1 would create cycle k1 -> k2 -> k3 -> k1
+        with pytest.raises(ValueError, match="cycle"):
+            db.fact_supersede("k3", "k1")
+
+    def test_fact_supersession_head(self):
+        db.fact_set("k1", {"value": "v1"})
+        db.fact_set("k2", {"value": "v2"})
+        db.fact_set("k3", {"value": "v3"})
+
+        assert db.fact_supersession_head("k1") is None
+
+        db.fact_supersede("k1", "k2")
+        assert db.fact_supersession_head("k1") == "k2"
+
+        db.fact_supersede("k2", "k3")
+        assert db.fact_supersession_head("k1") == "k3"
+        assert db.fact_supersession_head("k2") == "k3"
+        assert db.fact_supersession_head("k3") is None
+
+    def test_fact_delete_revives_superseded(self):
+        db.fact_set("k1", {"value": "v1"})
+        db.fact_set("k2", {"value": "v2"})
+        db.fact_supersede("k1", "k2")
+
+        assert db.fact_get("k1")["superseded_by"] == "k2"
+        db.fact_delete("k2")
+        assert "superseded_by" not in db.fact_get("k1")
+
+    def test_find_superseded_keys(self):
+        known = {
+            "omo_grok47_FIXED_plugin_030_v1_api_LIVE_verified_2026_09_22",
+            "fact_alpha_12345",
+            "fact_beta_67890",
+            "own_fact_key_12345",
+        }
+
+        # Required test literal from live store
+        text = "ОТМЕНЯЕТ мой ошибочный вывод из omo_grok47_FIXED_plugin_030_v1_api_LIVE_verified_2026_09_22 («effort у 4.7 срезается»)"
+        keys = db.find_superseded_keys("own_fact_key_12345", text, known)
+        assert keys == ["omo_grok47_FIXED_plugin_030_v1_api_LIVE_verified_2026_09_22"]
+
+        # All active verbs
+        for verb in [
+            "ОТМЕНЯЕТ", "ОТМЕНЯЮТ", "ИСПРАВЛЯЕТ", "ЗАМЕНЯЕТ", "ОПРОВЕРГАЕТ",
+            "SUPERSEDES", "CORRECTS", "RETRACTS", "REPLACES",
+            "отменяет", "replaces", "исправляет"
+        ]:
+            t = f"This fact {verb} fact_alpha_12345."
+            assert db.find_superseded_keys("own_fact_key_12345", t, known) == ["fact_alpha_12345"]
+
+        # Forbidden passive / past participle verbs
+        for bad_verb in [
+            "superseded", "supersede", "corrected", "replaced",
+            "ОТМЕНЁН", "ИСПРАВЛЕН", "ЗАМЕНЁН", "отменён", "исправлен", "заменён"
+        ]:
+            t = f"This fact was {bad_verb} by fact_alpha_12345."
+            assert db.find_superseded_keys("own_fact_key_12345", t, known) == []
+
+        # Negation guard
+        assert db.find_superseded_keys("own_fact_key_12345", "НЕ ОТМЕНЯЕТ fact_alpha_12345", known) == []
+        assert db.find_superseded_keys("own_fact_key_12345", "NOT SUPERSEDES fact_alpha_12345", known) == []
+        assert db.find_superseded_keys("own_fact_key_12345", "not replaces fact_alpha_12345", known) == []
+
+        # Stop at newline, period, semicolon, or 220 chars
+        t_stop = "ОТМЕНЯЕТ fact_alpha_12345. And mentions fact_beta_67890."
+        assert db.find_superseded_keys("own_fact_key_12345", t_stop, known) == ["fact_alpha_12345"]
+
+        t_semi = "ОТМЕНЯЕТ fact_alpha_12345; also fact_beta_67890"
+        assert db.find_superseded_keys("own_fact_key_12345", t_semi, known) == ["fact_alpha_12345"]
+
+        t_nl = "ОТМЕНЯЕТ fact_alpha_12345\nfact_beta_67890"
+        assert db.find_superseded_keys("own_fact_key_12345", t_nl, known) == ["fact_alpha_12345"]
+
+        # Multiple keys inside window: order preserved and deduped
+        t_multi = "REPLACES fact_alpha_12345 and fact_beta_67890 and fact_alpha_12345"
+        assert db.find_superseded_keys("own_fact_key_12345", t_multi, known) == [
+            "fact_alpha_12345", "fact_beta_67890"
+        ]
+
+        # Ignores own_key
+        t_own = "REPLACES own_fact_key_12345 and fact_alpha_12345"
+        assert db.find_superseded_keys("own_fact_key_12345", t_own, known) == ["fact_alpha_12345"]
+

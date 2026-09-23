@@ -17,12 +17,14 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import sqlite3
 import threading
+from collections.abc import Collection, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # numpy is imported lazily at runtime; see embedding_load
     import numpy as np
@@ -239,12 +241,18 @@ CREATE INDEX IF NOT EXISTS idx_embeddings_kind  ON embeddings(kind);
 CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(model);
 """
 
+_V6_SCHEMA_SQL = """
+ALTER TABLE facts ADD COLUMN superseded_by TEXT;
+CREATE INDEX IF NOT EXISTS idx_facts_superseded_by ON facts(superseded_by);
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: _V1_SCHEMA_SQL,
     2: _V2_SCHEMA_SQL,
     3: _V3_SCHEMA_SQL,
     4: _V4_REPAIR_SQL,
     5: _V5_SCHEMA_SQL,
+    6: _V6_SCHEMA_SQL,
 }
 
 # ---------------------------------------------------------------------------
@@ -383,7 +391,7 @@ def _exec(conn: sqlite3.Connection | None, sql: str, params: tuple = ()) -> None
 # Facts (Layer 1)
 # ---------------------------------------------------------------------------
 
-_FACT_OPTIONAL_FIELDS = ("updated_at", "last_reinforced_at", "ttl_days", "expires_at")
+_FACT_OPTIONAL_FIELDS = ("updated_at", "last_reinforced_at", "ttl_days", "expires_at", "superseded_by")
 
 
 def _row_to_fact(row: sqlite3.Row) -> dict:
@@ -397,7 +405,7 @@ def _row_to_fact(row: sqlite3.Row) -> dict:
 def fact_get(key: str) -> dict | None:
     with read_conn() as c:
         row = c.execute(
-            "SELECT key, value, updated_at, last_reinforced_at, ttl_days, expires_at "
+            "SELECT key, value, updated_at, last_reinforced_at, ttl_days, expires_at, superseded_by "
             "FROM facts WHERE key = ?",
             (key,),
         ).fetchone()
@@ -407,7 +415,7 @@ def fact_get(key: str) -> dict | None:
 def fact_all() -> dict[str, dict]:
     with read_conn() as c:
         rows = c.execute(
-            "SELECT key, value, updated_at, last_reinforced_at, ttl_days, expires_at "
+            "SELECT key, value, updated_at, last_reinforced_at, ttl_days, expires_at, superseded_by "
             "FROM facts ORDER BY key"
         ).fetchall()
     return {row["key"]: _row_to_fact(row) for row in rows}
@@ -461,16 +469,157 @@ def fact_set_many(
 
 
 def fact_delete(key: str, conn: sqlite3.Connection | None = None) -> bool:
-    sql = "DELETE FROM facts WHERE key = ?"
+    revive_sql = "UPDATE facts SET superseded_by = NULL WHERE superseded_by = ?"
+    delete_sql = "DELETE FROM facts WHERE key = ?"
     if conn is not None:
-        return conn.execute(sql, (key,)).rowcount > 0
+        conn.execute(revive_sql, (key,))
+        return conn.execute(delete_sql, (key,)).rowcount > 0
     with write_txn() as c:
-        return c.execute(sql, (key,)).rowcount > 0
+        c.execute(revive_sql, (key,))
+        return c.execute(delete_sql, (key,)).rowcount > 0
+
+
+def fact_supersede(
+    old_key: str, new_key: str | None, conn: sqlite3.Connection | None = None
+) -> None:
+    if not old_key:
+        raise ValueError("old_key is required")
+
+    def _apply(c: sqlite3.Connection) -> None:
+        row_old = c.execute(
+            "SELECT key FROM facts WHERE key = ?", (old_key,)
+        ).fetchone()
+        if row_old is None:
+            raise ValueError(f"Fact {old_key!r} not found")
+
+        if not new_key:
+            c.execute(
+                "UPDATE facts SET superseded_by = NULL WHERE key = ?", (old_key,)
+            )
+            return
+
+        if old_key == new_key:
+            raise ValueError(f"Fact {old_key!r} cannot supersede itself")
+
+        row_new = c.execute(
+            "SELECT key FROM facts WHERE key = ?", (new_key,)
+        ).fetchone()
+        if row_new is None:
+            raise ValueError(f"Fact {new_key!r} not found")
+
+        # Detect cycles by following superseded_by from new_key
+        curr = new_key
+        visited = set()
+        while curr:
+            if curr == old_key:
+                raise ValueError(
+                    f"Supersession cycle detected: linking {old_key!r} -> {new_key!r} "
+                    f"creates a cycle"
+                )
+            if curr in visited:
+                break
+            visited.add(curr)
+            row_next = c.execute(
+                "SELECT superseded_by FROM facts WHERE key = ?", (curr,)
+            ).fetchone()
+            curr = row_next["superseded_by"] if row_next else None
+
+        c.execute(
+            "UPDATE facts SET superseded_by = ? WHERE key = ?", (new_key, old_key)
+        )
+
+    if conn is not None:
+        _apply(conn)
+    else:
+        with write_txn() as c:
+            _apply(c)
+
+
+def fact_supersession_head(
+    key: str, conn: sqlite3.Connection | None = None
+) -> str | None:
+    def _find(c: sqlite3.Connection) -> str | None:
+        row = c.execute(
+            "SELECT superseded_by FROM facts WHERE key = ?", (key,)
+        ).fetchone()
+        if not row or not row["superseded_by"]:
+            return None
+
+        curr = row["superseded_by"]
+        head = curr
+        visited = {key}
+        while curr:
+            if curr in visited:
+                # Cycle encountered; break safely
+                break
+            visited.add(curr)
+            head = curr
+            row_next = c.execute(
+                "SELECT superseded_by FROM facts WHERE key = ?", (curr,)
+            ).fetchone()
+            curr = row_next["superseded_by"] if row_next else None
+        return head
+
+    if conn is not None:
+        return _find(conn)
+    with read_conn() as c:
+        return _find(c)
+
+
+def fact_predecessors(key: str) -> list[str]:
+    """Keys of the facts that ``key`` directly supersedes (indexed lookup)."""
+    with read_conn() as c:
+        rows = c.execute(
+            "SELECT key FROM facts WHERE superseded_by = ? ORDER BY key", (key,)
+        ).fetchall()
+    return [row["key"] for row in rows]
 
 
 def fact_count() -> int:
     with read_conn() as c:
         return int(c.execute("SELECT COUNT(*) FROM facts").fetchone()[0])
+
+
+_VERB_REGEX = re.compile(
+    r"\b(ОТМЕНЯЕТ|ОТМЕНЯЮТ|ИСПРАВЛЯЕТ|ЗАМЕНЯЕТ|ОПРОВЕРГАЕТ|SUPERSEDES|CORRECTS|RETRACTS|REPLACES)\b",
+    re.IGNORECASE,
+)
+_KEY_TOKEN_REGEX = re.compile(r"[A-Za-z0-9_]{12,}")
+
+
+def find_superseded_keys(
+    own_key: str, text: str, known_keys: Collection[str]
+) -> list[str]:
+    if not text:
+        return []
+
+    results: list[str] = []
+    seen = {own_key}
+
+    for match in _VERB_REGEX.finditer(text):
+        start = match.start()
+        prefix = text[:start]
+        if prefix.upper().endswith("НЕ ") or prefix.upper().endswith("NOT "):
+            continue
+
+        verb_end = match.end()
+        window_raw = text[verb_end : verb_end + 220]
+
+        # Stop at the first newline, period, or semicolon
+        window_end = len(window_raw)
+        for stop_char in ("\n", ".", ";"):
+            idx = window_raw.find(stop_char)
+            if idx != -1 and idx < window_end:
+                window_end = idx
+
+        window = window_raw[:window_end]
+
+        for token in _KEY_TOKEN_REGEX.findall(window):
+            if token in known_keys and token not in seen:
+                seen.add(token)
+                results.append(token)
+
+    return results
 
 
 # ---------------------------------------------------------------------------
