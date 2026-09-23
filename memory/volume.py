@@ -56,6 +56,16 @@ FALLBACK_TAU = 168.0
 # one, so volumes converge instead of everything pinning at MAX_VOLUME.
 REINFORCE_BOOST = 12.0
 
+# Ceiling for a superseded fact, as a fraction of its correction's effective
+# volume. Deliberately not lower: in the live store about half of all
+# corrections rewrite only a section, a status line or one conclusion of the
+# older fact, and the rest of it is still true. The cap makes the correction
+# rank first at link time and superseded facts stay frozen afterwards (no boost,
+# no clock reset). Volume alone does not keep that order forever — a young
+# correction decays faster than an old fact in its flat tail — so the read
+# paths also order and mark superseded facts regardless of volume.
+SUPERSEDED_VOLUME_RATIO = 0.8
+
 # A layer is only rewritten by sleep() when it drifted by more than this, so a
 # no-op nightly run does not churn every row in the database.
 DECAY_EPSILON = 0.01
@@ -256,6 +266,16 @@ def reinforce(
           one logical unit and must land (or roll back) together.
     Returns the new volume.
     """
+    # A superseded fact is frozen: recalling it must not lift it back above
+    # the correction that replaced it (that is how the bug this guards against
+    # happened in the first place — the wrong claim was recalled more often).
+    if layer == "fact":
+        fact = db.fact_get(entry_id)
+        if fact and fact.get("superseded_by"):
+            if last_reinforced_at is not None:
+                return effective_volume(layer, entry_id, last_reinforced_at)
+            return get_volume(layer, entry_id)
+
     if last_reinforced_at is not None:
         current = effective_volume(layer, entry_id, last_reinforced_at)
     else:
@@ -269,6 +289,65 @@ def reinforce(
     if log_event is not None:
         log_event(entry_id, "recall", new_vol, layer, conn=conn)
     return new_vol
+
+
+def _cap_below(
+    old_key: str, new_key: str, conn: sqlite3.Connection | None
+) -> tuple[float, bool]:
+    """Lower ``old_key`` to the cap under ``new_key``; never raises it.
+
+    Returns the old fact's effective volume afterwards and whether it changed.
+    """
+    old_fact = db.fact_get(old_key)
+    new_fact = db.fact_get(new_key)
+    old_lr = old_fact.get("last_reinforced_at") if old_fact else None
+    new_lr = new_fact.get("last_reinforced_at") if new_fact else None
+
+    ceiling = SUPERSEDED_VOLUME_RATIO * effective_volume("fact", new_key, new_lr)
+    old_effective = effective_volume("fact", old_key, old_lr)
+    if old_effective <= ceiling:
+        return old_effective, False
+
+    # effective = stored * decay factor of the old fact's own age, so solve for
+    # the stored value that lands on the ceiling.
+    factor = decayed(1.0, "fact", old_lr)
+    new_stored = clamp(ceiling / factor)
+    set_volume("fact", old_key, new_stored, conn=conn)
+    # Drop the decay anchor. It places the fact on the flat tail of the curve,
+    # while the read path decays from the clock as if from age 0: the next
+    # sleep() would lift the fact above the value just capped, and it would
+    # then fade slower than its correction. Without the anchor, sleep()
+    # continues from exactly the value the read path shows now.
+    db.decay_anchor_delete(zset_key("fact", old_key), conn=conn)
+    return decayed(new_stored, "fact", old_lr), True
+
+
+def demote_superseded(
+    old_key: str, new_key: str, conn: sqlite3.Connection | None = None
+) -> float:
+    """Cap a superseded fact below the fact that supersedes it.
+
+    Without this a correction starts out quieter than the claim it corrects:
+    the old fact has had weeks of recalls, the correction has had none. The
+    cap is SUPERSEDED_VOLUME_RATIO of the correction's effective volume. Only
+    ever lowers. Returns the old fact's effective volume after the call.
+
+    Lowering a fact re-caps the facts it supersedes, down the whole chain:
+    their caps were computed against its previous volume. Without this walk,
+    linking B -> C after A -> B left A above its cap under B.
+    """
+    effective, lowered = _cap_below(old_key, new_key, conn)
+    pending = [old_key] if lowered else []
+    seen = {old_key, new_key}
+    while pending:
+        head = pending.pop()
+        for older in db.fact_predecessors(head):
+            if older in seen:  # links are acyclic; this only guards bad data
+                continue
+            seen.add(older)
+            if _cap_below(older, head, conn)[1]:
+                pending.append(older)
+    return effective
 
 
 # ---------------------------------------------------------------------------
