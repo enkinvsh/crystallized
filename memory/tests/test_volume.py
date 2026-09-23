@@ -1,5 +1,7 @@
 """Tests for volume and supersession demotion (volume.py)."""
 
+from datetime import datetime, timedelta
+
 import pytest
 
 import db
@@ -79,3 +81,52 @@ def test_lowering_a_fact_recaps_the_facts_it_supersedes():
     b = volume.effective_volume("fact", "chain_b")
     assert b <= ratio * volume.effective_volume("fact", "chain_c") + 1e-6
     assert volume.effective_volume("fact", "chain_a") <= ratio * b + 1e-6
+
+
+def _effective_at(key, at):
+    fact = db.fact_get(key)
+    return volume.decayed(
+        volume.get_volume("fact", key), "fact", fact["last_reinforced_at"], at
+    )
+
+
+def test_sleep_closes_a_cap_that_drifted_open():
+    """A cap is exact only at the instant it is applied.
+
+    Decay is a power law of each fact's own age: a fresh correction sits on
+    the steep head of the curve, the old fact on its flat tail, so days later
+    the old fact is back above its cap (live store 2026-09-23: 6 of 200).
+    """
+    t0 = datetime(2026, 9, 1, 12, 0)
+    db.fact_set("f_old", {"value": "old", "last_reinforced_at": (t0 - timedelta(days=30)).isoformat()})
+    db.fact_set("f_new", {"value": "new", "last_reinforced_at": t0.isoformat()})
+    volume.set_volume("fact", "f_old", 100.0)
+    volume.set_volume("fact", "f_new", 50.0)
+    db.fact_supersede("f_old", "f_new")
+    ratio = volume.SUPERSEDED_VOLUME_RATIO
+
+    assert volume.recap_superseded(now=t0) == 1
+    assert _effective_at("f_old", t0) == pytest.approx(ratio * _effective_at("f_new", t0))
+
+    later = t0 + timedelta(days=10)
+    assert _effective_at("f_old", later) > ratio * _effective_at("f_new", later)
+
+    volume.sleep(now=later)
+    assert _effective_at("f_old", later) <= ratio * _effective_at("f_new", later) + 1e-6
+
+
+def test_recap_walks_chains_from_the_head():
+    for key in ("chain_a", "chain_b", "chain_c"):
+        db.fact_set(key, {"value": key})
+        volume.set_volume("fact", key, 90.0)
+    # Linked without demotion, the way a raw store update would leave them.
+    db.fact_supersede("chain_a", "chain_b")
+    db.fact_supersede("chain_b", "chain_c")
+
+    assert volume.recap_superseded() == 2
+
+    ratio = volume.SUPERSEDED_VOLUME_RATIO
+    b = volume.effective_volume("fact", "chain_b")
+    assert b == pytest.approx(ratio * volume.effective_volume("fact", "chain_c"))
+    assert volume.effective_volume("fact", "chain_a") == pytest.approx(ratio * b)
+    assert volume.recap_superseded() == 0

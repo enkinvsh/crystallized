@@ -292,7 +292,10 @@ def reinforce(
 
 
 def _cap_below(
-    old_key: str, new_key: str, conn: sqlite3.Connection | None
+    old_key: str,
+    new_key: str,
+    conn: sqlite3.Connection | None,
+    now: datetime | None = None,
 ) -> tuple[float, bool]:
     """Lower ``old_key`` to the cap under ``new_key``; never raises it.
 
@@ -303,14 +306,15 @@ def _cap_below(
     old_lr = old_fact.get("last_reinforced_at") if old_fact else None
     new_lr = new_fact.get("last_reinforced_at") if new_fact else None
 
-    ceiling = SUPERSEDED_VOLUME_RATIO * effective_volume("fact", new_key, new_lr)
-    old_effective = effective_volume("fact", old_key, old_lr)
-    if old_effective <= ceiling:
+    ceiling = SUPERSEDED_VOLUME_RATIO * decayed(get_volume("fact", new_key), "fact", new_lr, now)
+    old_effective = decayed(get_volume("fact", old_key), "fact", old_lr, now)
+    # Slack: ceiling / factor * factor can land one ulp above the ceiling.
+    if old_effective <= ceiling + 1e-6:
         return old_effective, False
 
     # effective = stored * decay factor of the old fact's own age, so solve for
     # the stored value that lands on the ceiling.
-    factor = decayed(1.0, "fact", old_lr)
+    factor = decayed(1.0, "fact", old_lr, now)
     new_stored = clamp(ceiling / factor)
     set_volume("fact", old_key, new_stored, conn=conn)
     # Drop the decay anchor. It places the fact on the flat tail of the curve,
@@ -319,7 +323,7 @@ def _cap_below(
     # then fade slower than its correction. Without the anchor, sleep()
     # continues from exactly the value the read path shows now.
     db.decay_anchor_delete(zset_key("fact", old_key), conn=conn)
-    return decayed(new_stored, "fact", old_lr), True
+    return decayed(new_stored, "fact", old_lr, now), True
 
 
 def demote_superseded(
@@ -348,6 +352,37 @@ def demote_superseded(
             if _cap_below(older, head, conn)[1]:
                 pending.append(older)
     return effective
+
+
+def recap_superseded(now: datetime | None = None) -> int:
+    """Re-apply every supersession cap. Returns how many facts were lowered.
+
+    A cap is exact only at the instant it is applied. Decay is a power law of
+    each fact's OWN age: a fresh correction sits on the steep head of the
+    curve, the fact it replaced on the flat tail, so within days the old fact
+    is back above its cap (live store 2026-09-23: 6 of 200). sleep() runs
+    this after every decay pass. Chains are capped from the head down, so
+    each fact is measured against a successor that is already final.
+    """
+    links = {
+        key: fact["superseded_by"]
+        for key, fact in db.fact_all().items()
+        if fact.get("superseded_by")
+    }
+
+    def depth(key: str) -> int:
+        steps = 0
+        while key in links and steps <= len(links):  # acyclic; guards bad data
+            key = links[key]
+            steps += 1
+        return steps
+
+    lowered = 0
+    with db.write_txn() as txn:
+        for key in sorted(links, key=depth):
+            if _cap_below(key, links[key], txn, now)[1]:
+                lowered += 1
+    return lowered
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +590,8 @@ def sleep(
 
     with contextlib.suppress(Exception):
         stats["fact"] = _decay_facts(now)
+    with contextlib.suppress(Exception):
+        recap_superseded(now)
     with contextlib.suppress(Exception):
         stats["semantic"] = _decay_semantic(
             now, readonly_semantic, writable_semantic, writable_semantic_update
