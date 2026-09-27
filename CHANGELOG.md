@@ -57,6 +57,7 @@ Crystallized becomes a self-contained, self-evolving memory engine. The Redis de
 - `uninstall.sh` now removes only the files listed in the install manifest. A previous glob-based approach would have deleted unrelated user scripts kept in the same directory.
 - Fixed a latent migration bug inherited from the runtime prototype, where the schema hardcoded `PRAGMA user_version = 1` and re-ran on every connection, leaving the version pinned and any future migration dead on arrival.
 - `install.sh` now deploys `memory/ui.html` next to `ui.py`. The installer copied only Python modules, so the local memory browser had no page to serve on a fresh install.
+- On Linux the memory server now installs the CPU build of `torch` from the PyTorch index. The default PyPI build pulled in about 4.8 GB of CUDA libraries that the embedding model never uses; the whole environment is now about 1.2 GB.
 
 ## [v1.1.0] - Unreleased
 

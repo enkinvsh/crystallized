@@ -8,7 +8,19 @@ dependencies = [
     "chromadb>=1.0.0",
     "sentence-transformers>=3.0.0",
     "httpx[socks]>=0.28.1",
+    # Pulled in by sentence-transformers anyway. Listed directly so the Linux
+    # source below applies: the default PyPI build for Linux drags in several
+    # gigabytes of CUDA libraries that a memory server never uses.
+    "torch>=2.4",
 ]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [dependency-groups]
 dev = [
