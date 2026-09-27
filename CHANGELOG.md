@@ -56,6 +56,7 @@ Crystallized becomes a self-contained, self-evolving memory engine. The Redis de
 - `uninstall.sh` now unregisters Crystallized hooks from `~/.claude/settings.json`, identifying them by path and leaving every foreign hook and every foreign key untouched. Events left empty are pruned.
 - `uninstall.sh` now removes only the files listed in the install manifest. A previous glob-based approach would have deleted unrelated user scripts kept in the same directory.
 - Fixed a latent migration bug inherited from the runtime prototype, where the schema hardcoded `PRAGMA user_version = 1` and re-ran on every connection, leaving the version pinned and any future migration dead on arrival.
+- `install.sh` now deploys `memory/ui.html` next to `ui.py`. The installer copied only Python modules, so the local memory browser had no page to serve on a fresh install.
 
 ## [v1.1.0] - Unreleased
 

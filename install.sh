@@ -371,10 +371,12 @@ step "4. Memory MCP server"
 # ═══════════════════════════════════════════════
 
 REQUIRED_MEMORY_FILES=(server.py db.py pyproject.toml uv.lock)
-OPTIONAL_MEMORY_FILES=(.python-version README.md)
+OPTIONAL_MEMORY_FILES=(.python-version README.md ui.html)
 
 # Every top-level module ships; tests, fixtures, caches, and the virtualenv all
 # live in subdirectories, so a non-recursive *.py glob is the whole allowlist.
+# Non-Python files a module needs at runtime (ui.py serves ui.html from its own
+# directory) go in OPTIONAL_MEMORY_FILES.
 collect_memory_modules() {
   local src="$1"
   DEPLOY_FILES=()
