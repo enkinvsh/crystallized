@@ -158,12 +158,8 @@ pkg_install() {
 step "1. Prerequisites"
 # ═══════════════════════════════════════════════
 
-check_git() {
-  if ! command -v git &>/dev/null; then
-    die "git is not installed. Please install git and re-run this script."
-  fi
-  success "git $(git --version | awk '{print $3}')"
-}
+# git is not checked: the installer never runs it. On a Mac without the Command
+# Line Tools, /usr/bin/git is a stub, and even `git --version` opens an install dialog.
 
 check_python() {
   local py_bin=""
@@ -196,7 +192,6 @@ check_curl() {
   success "curl $(curl --version | head -1 | awk '{print $2}')"
 }
 
-check_git
 check_python
 check_curl
 
@@ -602,9 +597,13 @@ plugins_added = []
 tmpl_plugins = template_config.get("plugin", [])
 if tmpl_plugins:
     existing_plugins = existing.setdefault("plugin", [])
-    existing_names = {p.split("@", 1)[0] for p in existing_plugins if isinstance(p, str)}
+    # Package name without the version. Scoped names start with "@", so split at the last "@" past index 0.
+    def package_name(spec):
+        cut = spec.rfind("@")
+        return spec[:cut] if cut > 0 else spec
+    existing_names = {package_name(p) for p in existing_plugins if isinstance(p, str)}
     for plugin in tmpl_plugins:
-        if isinstance(plugin, str) and plugin.split("@", 1)[0] not in existing_names:
+        if isinstance(plugin, str) and package_name(plugin) not in existing_names:
             existing_plugins.append(plugin)
             plugins_added.append(plugin)
 

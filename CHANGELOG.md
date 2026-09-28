@@ -58,6 +58,9 @@ Crystallized becomes a self-contained, self-evolving memory engine. The Redis de
 - Fixed a latent migration bug inherited from the runtime prototype, where the schema hardcoded `PRAGMA user_version = 1` and re-ran on every connection, leaving the version pinned and any future migration dead on arrival.
 - `install.sh` now deploys `memory/ui.html` next to `ui.py`. The installer copied only Python modules, so the local memory browser had no page to serve on a fresh install.
 - On Linux the memory server now installs the CPU build of `torch` from the PyTorch index. The default PyPI build pulled in about 4.8 GB of CUDA libraries that the embedding model never uses; the whole environment is now about 1.2 GB.
+- The installer no longer checks for `git`. It never runs git, and on a Mac without the Command Line Tools `/usr/bin/git` is a stub that opens an install dialog even for `git --version`.
+- The `opencode.json` template now pins `oh-my-openagent@5.0.0` and `@ex-machina/opencode-anthropic-auth@1.8.5` instead of `@latest` and an old `1.8.1`. With `@latest`, the first opencode command after install could hang for minutes while the package was resolved.
+- The plugin merge now compares scoped package names correctly. Before, any existing scoped plugin such as `@tarquinen/opencode-dcp` made the installer skip every scoped plugin from the template.
 
 ## [v1.1.0] - Unreleased
 
