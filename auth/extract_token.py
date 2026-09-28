@@ -3,8 +3,10 @@
 Extract Anthropic OAuth tokens from Claude Desktop (macOS / Windows) and inject into opencode auth.json.
 
 How it works:
-- Claude Desktop stores OAuth tokens in its config.json under the key `oauth:tokenCache`,
-  encrypted with Electron safeStorage.
+- Claude Desktop stores OAuth tokens in its config.json, encrypted with Electron safeStorage.
+  Claude Desktop 2.x keeps them under `oauth:tokenCacheV2`, older builds under `oauth:tokenCache`;
+  both are read. Only tokens of the Claude Code client with the `user:inference` scope work in
+  opencode, the rest are skipped.
 - On macOS:
   safeStorage uses AES-128-CBC with PBKDF2(sha1, salt="saltysalt", iter=1003, dkLen=16).
   The master password lives in macOS Keychain under service "Claude Safe Storage".
@@ -48,6 +50,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 IS_MACOS = platform.system() == "Darwin"
 IS_WINDOWS = platform.system() == "Windows"
 KEYCHAIN_SERVICE = "Claude Safe Storage"
+TOKEN_CACHE_KEYS = ("oauth:tokenCacheV2", "oauth:tokenCache")
+CLAUDE_CODE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 
 
 def get_opencode_auth_path() -> Path:
@@ -193,29 +197,78 @@ def check_claude_quit() -> None:
                 sys.exit(1)
 
 
-def load_token_cache() -> dict[str, Any]:
-    """Load and decrypt Claude Desktop OAuth token cache."""
+def load_token_caches() -> dict[str, dict[str, Any]]:
+    """Load and decrypt every Claude Desktop OAuth token cache present in config.json."""
     config_path, local_state_path = get_claude_paths()
     if not config_path.exists():
         sys.exit(f"Claude config not found at {config_path}")
 
     cfg = json.loads(config_path.read_text(encoding="utf-8-sig"))
-    blob = cfg.get("oauth:tokenCache")
-    if not blob:
-        sys.exit("No 'oauth:tokenCache' in Claude config. Are you logged into Claude Desktop?")
+    blobs = {name: cfg[name] for name in TOKEN_CACHE_KEYS if cfg.get(name)}
+    if not blobs:
+        sys.exit("No OAuth token cache in Claude config. Are you logged into Claude Desktop?")
 
+    caches: dict[str, dict[str, Any]] = {}
     if IS_MACOS:
         pwd = get_mac_keychain_password()
-        decrypted = decrypt_mac_safe_storage(blob, pwd)
+        for name, blob in blobs.items():
+            caches[name] = json.loads(decrypt_mac_safe_storage(blob, pwd))
     elif IS_WINDOWS:
         if not local_state_path:
             sys.exit("Could not locate Local State path on Windows.")
         key = get_windows_master_key(local_state_path)
-        decrypted = decrypt_windows_safe_storage(blob, key)
+        for name, blob in blobs.items():
+            caches[name] = json.loads(decrypt_windows_safe_storage(blob, key))
     else:
         sys.exit(f"Unsupported operating system: {platform.system()}")
+    return caches
 
-    return json.loads(decrypted)
+
+def split_cache_key(key: str) -> tuple[str, str]:
+    """Split `[acct:<account>|]<client>:<org>:<host>:<scope>` into (account, rest)."""
+    if key.startswith("acct:"):
+        account, _, rest = key[len("acct:"):].partition("|")
+        return account, rest
+    return "", key
+
+
+def usable_tokens(caches: dict[str, dict[str, Any]]) -> list[tuple[str, dict[str, Any]]]:
+    """Tokens opencode can use: Claude Code client with `user:inference`, one per account and org.
+
+    Claude Desktop 2.x keeps several such tokens per account (for example a one-month token
+    for the Code tab and a one-year token); the one that lives longest is taken.
+    """
+    groups: dict[tuple[str, str], list[tuple[str, dict[str, Any]]]] = {}
+    for name in TOKEN_CACHE_KEYS:
+        for key, tok in caches.get(name, {}).items():
+            if not isinstance(tok, dict):
+                continue  # Claude 2.x keeps revoked entries as null
+            account, rest = split_cache_key(key)
+            client, _, rest = rest.partition(":")
+            org, _, host_and_scope = rest.partition(":")
+            if client != CLAUDE_CODE_CLIENT_ID or "user:inference" not in host_and_scope:
+                continue
+            if not account and any(seen_org == org for _, seen_org in groups):
+                continue  # the old cache repeats what the new one already has
+            groups.setdefault((account, org), []).append((key, tok))
+    return [max(entries, key=lambda e: e[1].get("expiresAt") or 0) for entries in groups.values()]
+
+
+def describe_token(key: str, tok: dict[str, Any]) -> str:
+    """Short human label for a cache entry, without secrets."""
+    account, rest = split_cache_key(key)
+    parts = rest.split(":")
+    label = []
+    if account:
+        label.append(f"account={account[:8]}")
+    if len(parts) > 1:
+        label.append(f"org={parts[1][:8]}")
+    if tok.get("subscriptionType"):
+        label.append(f"plan={tok['subscriptionType']}")
+    exp_ms = tok.get("expiresAt") or tok.get("expires") or 0
+    exp_human = time.strftime("%Y-%m-%d %H:%M", time.localtime(exp_ms / 1000)) if exp_ms else "unknown"
+    label.append(f"expires={exp_human}")
+    return " ".join(label)
 
 
 def write_opencode_auth(token: dict[str, Any]) -> None:
@@ -262,26 +315,22 @@ def main() -> None:
     if not args.skip_quit_check:
         check_claude_quit()
 
-    cache = load_token_cache()
-    entries = list(cache.items())
+    caches = load_token_caches()
 
     if args.print:
-        print(json.dumps(cache, indent=2))
+        print(json.dumps(caches, indent=2))
         return
 
+    entries = usable_tokens(caches)
     if not entries:
-        sys.exit("Token cache is empty.")
+        sys.exit(
+            "No Claude Code token in Claude Desktop. Log in with a Pro or Max account, "
+            "send any message, quit Claude and run this again."
+        )
 
     print(f"Found {len(entries)} token(s):")
     for i, (key, tok) in enumerate(entries):
-        parts = key.split(":")
-        user_id = parts[0] if parts else "account"
-        exp_ms = tok.get("expiresAt") or tok.get("expires") or 0
-        if exp_ms:
-            exp_human = time.strftime("%Y-%m-%d %H:%M", time.localtime(exp_ms / 1000))
-        else:
-            exp_human = "unknown"
-        print(f"  [{i}] user={user_id} expires={exp_human}")
+        print(f"  [{i}] {describe_token(key, tok)}")
 
     if args.apply is not None:
         idx = args.apply
