@@ -11,7 +11,7 @@ Anthropic also inspects client headers. Requests without valid first-party heade
 Extracting the token directly from Claude Desktop solves both issues:
 1. Claude Desktop authenticates through official Single Sign-On (SSO) and writes valid OAuth tokens to disk.
 2. The extracted token carries first-party credentials.
-3. When paired with the `@ex-machina/opencode-anthropic-auth@1.8.1` plugin in opencode, outgoing requests include the required Claude Code identity headers.
+3. When paired with the `@ex-machina/opencode-anthropic-auth` plugin in opencode, outgoing requests include the required Claude Code identity headers.
 
 ```
 +-------------------------------------------------------------+
@@ -68,17 +68,18 @@ Ensure `@ex-machina/opencode-anthropic-auth` is declared in your `opencode.json`
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "@ex-machina/opencode-anthropic-auth@1.8.1"
+    "@ex-machina/opencode-anthropic-auth"
   ]
 }
 ```
 
-The floating tag `@ex-machina/opencode-anthropic-auth@latest` is also supported if you prefer to
-track the newest release instead of pinning to `1.8.1`.
+Without a version opencode installs the latest stable release once and keeps it in
+`~/.cache/opencode/packages/@ex-machina/opencode-anthropic-auth@latest`. To update the plugin,
+delete that folder and restart opencode.
 
 #### Anchor-Based System Prompt Sanitization
 
-Version `1.8.1` sanitizes the system prompt using **anchors** rather than truncation. The plugin
+Since version `1.8.1` the plugin sanitizes the system prompt using **anchors** rather than truncation. The plugin
 locates known marker strings in the outgoing prompt and removes only the client-identifying
 preamble attached to them, leaving everything else byte-for-byte untouched.
 
@@ -97,7 +98,7 @@ mode: nothing outside the identified preamble is rewritten, reordered, or droppe
 ## macOS Instructions
 
 ### How Decryption Works on macOS
-1. Claude.app stores token data in `~/Library/Application Support/Claude/config.json` under `oauth:tokenCache`.
+1. Claude.app stores token data in `~/Library/Application Support/Claude/config.json` under `oauth:tokenCacheV2` (Claude Desktop 2.x) or the older `oauth:tokenCache`. The script reads both.
 2. The data is encrypted using Electron `safeStorage` (AES-128-CBC, PBKDF2 with SHA-1, salt `saltysalt`, 1003 iterations).
 3. The encryption password is stored in the macOS Keychain under the generic password service `Claude Safe Storage`.
 
@@ -123,8 +124,8 @@ mode: nothing outside the identified preamble is rewritten, reordered, or droppe
    If your account has multiple workspaces, the script lists each one:
    ```text
    Found 2 token(s):
-     [0] user=user_example123 expires=2027-08-20 14:30
-     [1] user=user_example456 expires=2027-08-20 14:30
+     [0] account=1a2b3c4d org=5e6f7a8b plan=max expires=2027-08-20 14:30
+     [1] account=1a2b3c4d org=9c0d1e2f plan=team expires=2027-08-20 14:30
    Pick index to apply (or Ctrl+C to abort): 0
    ```
    Type the desired index number and press Enter.
@@ -141,7 +142,7 @@ mode: nothing outside the identified preamble is rewritten, reordered, or droppe
 ### How Decryption Works on Windows
 Windows uses a two-layer encryption scheme:
 1. **Master Key**: The Electron master key is stored in `Local State` under `os_crypt.encrypted_key`. It is encrypted with Windows DPAPI (`CryptProtectData`).
-2. **Payload**: The `oauth:tokenCache` string in `config.json` is encrypted with AES-256-GCM using the decrypted 32-byte master key.
+2. **Payload**: The `oauth:tokenCacheV2` (or older `oauth:tokenCache`) string in `config.json` is encrypted with AES-256-GCM using the decrypted 32-byte master key.
 3. **File Paths**: Claude Desktop on Windows is distributed as an MSIX package. Files reside in `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\`.
 
 ### Step-by-Step Procedure
